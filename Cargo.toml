@@ -1,0 +1,22 @@
+[package]
+name = "yadgar-store"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "Engine primitives for yadgar -db services: pool, transactions, migrations, capability probe, credentials, backup harness. Knows zero entity schemas."
+repository = "https://github.com/yadgarhq/store"
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# D59: warnings are errors at commit time, not in review.
+all = { level = "deny", priority = -1 }

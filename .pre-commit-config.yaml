@@ -1,0 +1,53 @@
+# Every yadgarhq repo carries pre-commit (D59). Hook failure is signal, not
+# obstacle: fix the cause and re-stage. Never --no-verify.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: check-yaml
+      - id: check-toml
+
+  - repo: local
+    hooks:
+      # Force-pushing does not scrub GitHub history — PR refs pin every commit
+      # and are never collected — so a credential that lands here means deleting
+      # and recreating the repository. Prevention is the only cheap point.
+      - id: gitleaks
+        name: Detect secrets and credentials
+        language: system
+        entry: gitleaks git --pre-commit --staged --verbose
+        pass_filenames: false
+
+      - id: cargo-fmt
+        name: cargo fmt
+        language: system
+        entry: cargo fmt --check
+        pass_filenames: false
+        files: \.rs$
+
+      # Warnings are errors at commit time rather than in review.
+      - id: cargo-clippy
+        name: cargo clippy
+        language: system
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        pass_filenames: false
+        files: \.(rs|toml)$
+
+      # The one genuinely new hook of D59: it turns O10's standing instruction
+      # to re-audit licences into a gate, instead of a line in a document that
+      # depends on being remembered.
+      #
+      # Invoked through `nix run` because cargo-deny is not yet in the dev
+      # profile. Simplify to a plain `cargo-deny` once it is.
+      - id: cargo-deny
+        name: cargo deny (licences, advisories, sources)
+        language: system
+        entry: nix run nixpkgs#cargo-deny -- check
+        pass_filenames: false
+        files: (Cargo\.(toml|lock)|deny\.toml)$
