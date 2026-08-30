@@ -13,38 +13,22 @@ repos:
       - id: check-yaml
       - id: check-toml
 
+  # Shared, from yadgarhq/actions (D62). These were local blocks copied into
+  # every Rust repository until the shared definition existed.
+  - repo: https://github.com/yadgarhq/actions
+    rev: v1
+    hooks:
+      - id: gitleaks
+      - id: cargo-fmt
+      - id: cargo-clippy
+
   - repo: local
     hooks:
-      # Force-pushing does not scrub GitHub history — PR refs pin every commit
-      # and are never collected — so a credential that lands here means deleting
-      # and recreating the repository. Prevention is the only cheap point.
-      - id: gitleaks
-        name: Detect secrets and credentials
-        language: system
-        entry: gitleaks git --pre-commit --staged --verbose
-        pass_filenames: false
-
-      - id: cargo-fmt
-        name: cargo fmt
-        language: system
-        entry: cargo fmt --check
-        pass_filenames: false
-        files: \.rs$
-
-      # Warnings are errors at commit time rather than in review.
-      - id: cargo-clippy
-        name: cargo clippy
-        language: system
-        entry: cargo clippy --all-targets --all-features -- -D warnings
-        pass_filenames: false
-        files: \.(rs|toml)$
-
-      # The one genuinely new hook of D59: it turns O10's standing instruction
-      # to re-audit licences into a gate, instead of a line in a document that
-      # depends on being remembered.
-      #
-      # Invoked through `nix run` because cargo-deny is not yet in the dev
-      # profile. Simplify to a plain `cargo-deny` once it is.
+      # NOT the shared cargo-deny hook, and only until cargo-deny is in the dev
+      # profile — the shared one calls `cargo deny` directly, which is right
+      # once the tool is installed. Adopting it now would fail every commit
+      # here. `nix run` is slower but works today. CI runs the real check
+      # regardless, so the gate is not lost while this override stands.
       - id: cargo-deny
         name: cargo deny (licences, advisories, sources)
         language: system

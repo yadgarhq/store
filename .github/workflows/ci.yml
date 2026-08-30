@@ -1,39 +1,29 @@
 name: ci
 
+# CI is defined once in yadgarhq/actions (D62). This file is the whole of this
+# repository's CI configuration: the shared workflows detect what the repository
+# is — Cargo.toml, buf.yaml, chart/, Dockerfile — and run what applies.
+#
+# Pinned to @v1, which is additive-only. Third-party actions are pinned by SHA
+# inside the shared workflows because a tag someone else owns can move; @v1 is
+# ours and moving it deliberately is how 70-odd repositories get an upgrade
+# without 70-odd edits.
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+    tags: ["v*"]
 
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+  pr:
+    if: github.event_name == 'pull_request'
+    uses: yadgarhq/actions/.github/workflows/ci-pr.yml@v1
 
-      - name: fmt
-        run: cargo fmt --check
-      - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: test
-        run: cargo test --all-features
-
-  licences:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # D24 requires a permissive stack stay viable and O10 requires the audit
-      # be re-run before adding a dependency. Enforced, not remembered.
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
+  # Direct pushes to main still get validated. The repository is pushed to
+  # directly, so gating only on pull requests would gate almost nothing.
+  validation:
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    uses: yadgarhq/actions/.github/workflows/ci-validation.yml@v1
