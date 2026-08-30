@@ -108,4 +108,102 @@ pub enum MigrationError {
          Refusing to start rather than operating on it blind."
     )]
     DatabaseAhead { applied: u64, known: u64 },
+
+    #[error("migration {version} ({name}) failed: {source}")]
+    Failed {
+        version: u64,
+        name: String,
+        #[source]
+        source: sqlx::Error,
+    },
+
+    #[error("the engine rejected a migration-ledger operation: {0}")]
+    Engine(#[source] sqlx::Error),
+}
+
+impl MigrationError {
+    fn engine(e: sqlx::Error) -> Self {
+        Self::Engine(e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Execution. Everything above is testable without a database and is where the
+// mistakes that corrupt data live; this half is where they take effect.
+// ---------------------------------------------------------------------------
+
+use sqlx::{AssertSqlSafe, MySqlPool};
+
+/// Where the applied version is recorded. One row per applied migration, never
+/// updated — so the history is readable, not just the high-water mark.
+const LEDGER: &str = "yadgar_schema_migrations";
+
+/// Apply everything pending, in order, and return the version now applied.
+///
+/// **One migration, one transaction.** Not one transaction for the whole set:
+/// MariaDB commits implicitly on DDL, so a multi-statement "transaction" around
+/// `ALTER TABLE` is a transaction in name only, and believing otherwise means
+/// believing a half-applied set will roll back when it will not. Per-migration
+/// is the honest unit — a failure leaves earlier migrations applied and recorded,
+/// which is recoverable because the ledger says exactly where it stopped.
+pub async fn apply(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, MigrationError> {
+    // AUDIT (sqlx 0.9 requires one): the only interpolation is LEDGER, a private
+    // const in this file. No caller input reaches it.
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {LEDGER} (
+             version BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+             name    VARCHAR(255)    NOT NULL,
+             applied_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+         )"
+    )))
+    .execute(pool)
+    .await
+    .map_err(MigrationError::engine)?;
+
+    // AUDIT: LEDGER const only.
+    let applied: u64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        // CAST is load-bearing, not decoration: MariaDB types
+        // COALESCE(MAX(unsigned), 0) as DECIMAL, and decoding that into u64
+        // fails at runtime with a type mismatch. Found by running against a
+        // real engine; no amount of logic testing would have surfaced it.
+        "SELECT CAST(COALESCE(MAX(version), 0) AS UNSIGNED) FROM {LEDGER}"
+    )))
+    .fetch_one(pool)
+    .await
+    .map_err(MigrationError::engine)?;
+
+    // Before applying anything: refuse a database this binary is older than.
+    set.check_not_ahead(applied)?;
+
+    let mut current = applied;
+    for m in set.pending_after(applied) {
+        // AUDIT: this IS the module's migration, and D7 makes `sql` opaque —
+        // this crate never parses it and cannot hold anyone's schema. The
+        // trust boundary is the module's own source tree, which is the same
+        // boundary as the code calling this function. There is no untrusted
+        // input here to escape; a hostile migration file is a compromised
+        // repository, not an injection.
+        sqlx::raw_sql(AssertSqlSafe(m.sql.clone()))
+            .execute(pool)
+            .await
+            .map_err(|e| MigrationError::Failed {
+                version: m.version,
+                name: m.name.clone(),
+                source: e,
+            })?;
+
+        // AUDIT: LEDGER const; version and name are bound parameters.
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {LEDGER} (version, name) VALUES (?, ?)"
+        )))
+        .bind(m.version)
+        .bind(&m.name)
+        .execute(pool)
+        .await
+        .map_err(MigrationError::engine)?;
+
+        current = m.version;
+    }
+
+    Ok(current)
 }
