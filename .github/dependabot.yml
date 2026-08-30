@@ -1,0 +1,27 @@
+# Dependabot. Per-repository by necessity — this file has to live in each repo,
+# unlike CI, which is defined once in yadgarhq/actions (D62).
+#
+# The github-actions ecosystem is the load-bearing one. Every third-party action
+# is SHA-pinned (D62), and a SHA is a pin that nobody notices going stale:
+# resolving them by hand once found SEVEN OF TWELVE were behind. Dependabot
+# turns that from an audit somebody has to remember into a pull request.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One PR rather than a dozen. These move together and reviewing them
+      # together is how the version-and-SHA pair stays legible.
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Patch and minor together; a major is worth its own PR and its own read.
+      minor-and-patch:
+        update-types: [minor, patch]
