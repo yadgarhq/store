@@ -1,0 +1,111 @@
+//! Migrations: this crate runs them, modules own them.
+//!
+//! D7 keeps `store` free of entity schemas, so it cannot hold anyone's
+//! migrations. It can only take what a module hands it and guarantee three
+//! things: applied in version order, applied exactly once, and never applied to
+//! a database that has already moved past them.
+//!
+//! Everything here is the ordering and safety logic, deliberately separate from
+//! executing SQL, because that half is testable without a database and is where
+//! the mistakes that corrupt data actually live.
+
+/// One migration. `sql` is opaque — this crate never parses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Migration {
+    /// Strictly increasing, starting at 1. Zero is reserved (see
+    /// [`MigrationError::ZeroVersion`]).
+    pub version: u64,
+    /// For error messages and the applied-migrations table. Not an identifier.
+    pub name: String,
+    pub sql: String,
+}
+
+/// A module's migrations, validated on construction.
+///
+/// Validating here rather than at apply time is deliberate: a duplicate version
+/// is a mistake in the source tree, and finding it on the deployment that
+/// happens to run second is finding it in the worst place.
+#[derive(Debug, Clone)]
+pub struct MigrationSet(Vec<Migration>);
+
+impl MigrationSet {
+    pub fn new(mut migrations: Vec<Migration>) -> Result<Self, MigrationError> {
+        // Sorted here rather than trusting the caller. A module builds this list
+        // by reading a directory, and directory order is not sorted order on
+        // every filesystem — the difference between a deterministic schema and
+        // one that depends on which machine ran it.
+        migrations.sort_by_key(|m| m.version);
+
+        if let Some(m) = migrations.iter().find(|m| m.version == 0) {
+            return Err(MigrationError::ZeroVersion {
+                name: m.name.clone(),
+            });
+        }
+
+        for pair in migrations.windows(2) {
+            if pair[0].version == pair[1].version {
+                return Err(MigrationError::DuplicateVersion {
+                    version: pair[0].version,
+                    first: pair[0].name.clone(),
+                    second: pair[1].name.clone(),
+                });
+            }
+        }
+
+        Ok(Self(migrations))
+    }
+
+    pub fn versions(&self) -> Vec<u64> {
+        self.0.iter().map(|m| m.version).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Everything above `applied`, in order.
+    pub fn pending_after(&self, applied: u64) -> impl Iterator<Item = &Migration> {
+        self.0.iter().filter(move |m| m.version > applied)
+    }
+
+    /// Refuse to run against a database that is ahead of this binary.
+    ///
+    /// The deployment this exists for is a rollback: the database sits at
+    /// version 5 while the older binary knows only 4. Treating that as "nothing
+    /// pending" runs old code against a newer schema **silently**, which is how
+    /// data is corrupted rather than how an outage happens. Failing at boot is
+    /// the whole point — the same reasoning as D7's capability probe.
+    pub fn check_not_ahead(&self, applied: u64) -> Result<(), MigrationError> {
+        let known = self.0.last().map(|m| m.version).unwrap_or(0);
+        if applied > known {
+            return Err(MigrationError::DatabaseAhead { applied, known });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationError {
+    #[error(
+        "migrations {first} and {second} both claim version {version}; \
+         one of them would silently never apply"
+    )]
+    DuplicateVersion {
+        version: u64,
+        first: String,
+        second: String,
+    },
+
+    #[error(
+        "migration {name} uses version 0, which is reserved: 0 is the marker \
+         for a database with nothing applied"
+    )]
+    ZeroVersion { name: String },
+
+    #[error(
+        "database is at migration {applied} but this binary knows only up to \
+         {known} — it is running against a schema from a newer version. \
+         Refusing to start rather than operating on it blind."
+    )]
+    DatabaseAhead { applied: u64, known: u64 },
+}

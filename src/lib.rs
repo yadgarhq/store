@@ -14,5 +14,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backup;
 pub mod capability;
 pub mod credentials;
+pub mod migrate;
+pub mod pool;
