@@ -231,3 +231,42 @@ async fn a_restore_that_lost_rows_fails_verification() {
         "3 backed up, 1 restored: this is the incident, and it must fail"
     );
 }
+
+/// THE REPLICA RACE, reproduced.
+///
+/// Two replicas boot at once against one database, both read `applied = 0`, and
+/// both try migration 1. Before the migration lock, one won and the other died
+/// on "Table 'task' already exists" — then crash-looped, because a failed
+/// migration is a failed boot. Observed on the first real two-replica deploy.
+///
+/// A single process cannot exhibit this, which is the whole argument for D55.
+#[tokio::test]
+async fn concurrent_replicas_do_not_race_on_migrations() {
+    let cfg = scratch("ys_race").await;
+    let (_, secret) = config_and_secret("ys_race");
+
+    // Two pools, as two replicas would have.
+    let a = yadgar_store::pool::connect(&cfg, &secret)
+        .await
+        .expect("pool a");
+    let b = yadgar_store::pool::connect(&cfg, &secret)
+        .await
+        .expect("pool b");
+
+    let (ma, mb) = (migrations(), migrations());
+    let (ra, rb) = tokio::join!(migrate::apply(&a, &ma), migrate::apply(&b, &mb));
+
+    // BOTH must succeed. One migrates, the other waits and finds the ledger
+    // already current — neither may fail, because a failing replica crash-loops.
+    let va = ra.expect("replica a must not fail");
+    let vb = rb.expect("replica b must not fail");
+    assert_eq!(va, 2);
+    assert_eq!(vb, 2);
+
+    // And the work happened exactly once: two rows, not four.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM yadgar_schema_migrations")
+        .fetch_one(&a)
+        .await
+        .expect("count");
+    assert_eq!(rows, 2, "each migration must be recorded exactly once");
+}
