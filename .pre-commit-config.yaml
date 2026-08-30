@@ -27,7 +27,7 @@ repos:
     hooks:
       - id: gitleaks
       - id: prettier
-      # No Dockerfile here yet; the hook is a no-op until one arrives, which is
+      # No Containerfile here yet; the hook is a no-op until one arrives, which is
       # cheaper than remembering to add it on the day it does.
       - id: hadolint
       - id: cargo-fmt
