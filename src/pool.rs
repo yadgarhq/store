@@ -11,6 +11,11 @@
 //! presents as intermittent "too many connections" under load, on whichever
 //! service happens to connect last, and scaling up makes it worse.
 
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
+use sqlx::MySqlPool;
+
+use crate::credentials::Secret;
+
 /// Connections an engine keeps back for `SUPER`, so an operator can still get in
 /// when the pools have taken everything.
 ///
@@ -82,8 +87,52 @@ impl PoolConfig {
     }
 }
 
+/// Open the pool, refusing first.
+///
+/// The headroom check runs HERE rather than being something a caller is trusted
+/// to remember. D4 makes the ceiling a correctness property of the topology, and
+/// a correctness property enforced by convention is one that holds until the
+/// first service forgets — at which point the symptom is intermittent "too many
+/// connections" on whichever service connected last, not a configuration error
+/// anyone can read.
+///
+/// The credential is applied here and never in [`PoolConfig::dsn`], because a
+/// DSN reaches logs, spans and error messages.
+pub async fn connect(config: &PoolConfig, secret: &Secret) -> Result<MySqlPool, PoolError> {
+    config.check_engine_headroom()?;
+
+    let options = MySqlConnectOptions::new()
+        .host(&config.host)
+        .port(config.port)
+        .database(&config.database)
+        .username(&config.username)
+        .password(secret.expose())
+        .ssl_mode(if config.require_tls {
+            MySqlSslMode::Required
+        } else {
+            MySqlSslMode::Disabled
+        });
+
+    MySqlPoolOptions::new()
+        .max_connections(config.max_connections)
+        .connect_with(options)
+        .await
+        .map_err(|source| PoolError::Connect {
+            // config.dsn() deliberately: it carries no credential.
+            dsn: config.dsn(),
+            source,
+        })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
+    #[error("could not connect to {dsn}: {source}")]
+    Connect {
+        dsn: String,
+        #[source]
+        source: sqlx::Error,
+    },
+
     #[error(
         "pool would exhaust the engine: {requested} connections requested \
          (max_connections x replicas) against an engine allowing {available}, \

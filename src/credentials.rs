@@ -18,6 +18,14 @@ use std::path::PathBuf;
 pub struct Secret(String);
 
 impl Secret {
+    /// Wrap a resolved credential. Public so a caller that obtained a secret by
+    /// some other sanctioned route (a test harness, a new
+    /// [`CredentialSource`]) can hand it to the pool without going through a
+    /// file — the type's job is redaction, not provenance.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
     /// Read the credential. Named to be conspicuous at the call site — this is
     /// the one place the value escapes, so it should be greppable.
     pub fn expose(&self) -> &str {

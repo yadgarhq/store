@@ -72,3 +72,65 @@ pub enum BackupError {
     #[error("restore verification could not be trusted: {detail}")]
     Incoherent { detail: String },
 }
+
+// ---------------------------------------------------------------------------
+// The counting half. `RestoreReport` is arithmetic over numbers; this is where
+// the numbers come from, and a report built from anything else is the 2026-06-16
+// failure waiting to happen — a check that passes because it was handed the
+// counts it wanted.
+// ---------------------------------------------------------------------------
+
+use sqlx::{AssertSqlSafe, MySqlPool, Row};
+
+/// What one schema actually contains, right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Census {
+    pub tables: u64,
+    pub rows: u64,
+}
+
+/// Count tables and rows in `schema` by reading every table.
+///
+/// **Not `information_schema.TABLES.TABLE_ROWS`**, which is an InnoDB *estimate*
+/// derived from sampled index statistics and can be off by a wide margin — one
+/// query, and it would make verification cheap and wrong. Verification is the
+/// thing that failed on 2026-06-16, so it counts for real.
+pub async fn census(pool: &MySqlPool, schema: &str) -> Result<Census, sqlx::Error> {
+    let names: Vec<String> = sqlx::query(
+        "SELECT TABLE_NAME FROM information_schema.TABLES
+         WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| r.try_get::<String, _>(0))
+    .collect::<Result<_, _>>()?;
+
+    let mut rows = 0u64;
+    for name in &names {
+        // The name came from information_schema for this schema, not from a
+        // caller, and it is backquoted — an identifier cannot be bound as a
+        // parameter, so this is the seam that has to be argued rather than
+        // assumed.
+        // AUDIT: an identifier cannot be a bound parameter, so this is the one
+        // place here that interpolates. `name` came from information_schema for
+        // this schema rather than from a caller, and both identifiers are
+        // backquoted with embedded backquotes doubled — the MariaDB escape.
+        // `schema` is caller-supplied, so it gets the same treatment rather than
+        // being trusted for being "just a schema name".
+        let n: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM `{}`.`{}`",
+            schema.replace('`', "``"),
+            name.replace('`', "``")
+        )))
+        .fetch_one(pool)
+        .await?;
+        rows += n as u64;
+    }
+
+    Ok(Census {
+        tables: names.len() as u64,
+        rows,
+    })
+}
