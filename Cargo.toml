@@ -16,7 +16,7 @@ tracing = "0.1"
 # and a base ten times larger carrying code nothing here uses. Choosing this at
 # the first service keeps the static musl build available; discovering it at the
 # fortieth means changing forty.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring",
     "mysql",
