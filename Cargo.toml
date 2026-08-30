@@ -26,6 +26,9 @@ tokio = { version = "1", features = ["rt", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The probe suite talks to a real engine (D69). The library itself stays
+# runtime-agnostic — only the tests need one.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"

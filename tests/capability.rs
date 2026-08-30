@@ -8,7 +8,7 @@ use yadgar_store::capability::{Capability, CapabilityError, CapabilitySet};
 
 #[test]
 fn satisfied_when_engine_has_everything_required() {
-    let engine = CapabilitySet::from([Capability::Transactions, Capability::FullText]);
+    let engine = CapabilitySet::from([Capability::Transactions, Capability::FullTextBm25]);
     let required = CapabilitySet::from([Capability::Transactions]);
     assert!(engine.satisfies(&required).is_ok());
 }
@@ -21,15 +21,19 @@ fn missing_capability_is_an_error_naming_every_gap_not_just_the_first() {
     let required = CapabilitySet::from([
         Capability::Transactions,
         Capability::Vector,
-        Capability::FullText,
+        Capability::FullTextBm25,
     ]);
 
     let err = engine.satisfies(&required).unwrap_err();
-    let CapabilityError::Missing(missing) = err;
+    // Set-based satisfies has no provenance to report; CapabilityReport's
+    // variant carries it (D69). Two variants because they know different things.
+    let CapabilityError::Missing(missing) = err else {
+        panic!("set-based satisfies reports the plain variant, got {err:?}");
+    };
 
     assert_eq!(missing.len(), 2);
     assert!(missing.contains(&Capability::Vector));
-    assert!(missing.contains(&Capability::FullText));
+    assert!(missing.contains(&Capability::FullTextBm25));
 }
 
 #[test]
