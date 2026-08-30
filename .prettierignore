@@ -1,0 +1,3 @@
+# Helm templates are Go templates wearing YAML. Prettier cannot parse them and
+# would mangle them if it could.
+chart/templates/

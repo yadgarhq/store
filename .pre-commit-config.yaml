@@ -21,6 +21,20 @@ repos:
   # would silently freeze each machine at whatever v1 meant the day it first ran.
   # GitHub Actions re-resolves @v1 every run; pre-commit does not. Bump with
   # `pre-commit autoupdate`.
+  # JSON, YAML and Markdown. `proseWrap: preserve` in .prettierrc is doing real
+  # work: without it prettier reflows prose and every future diff to a
+  # hand-wrapped document becomes unreadable. With it, prose line breaks are left
+  # exactly as written and only markup is normalised — measured at 15% of lines
+  # on the largest document here, all of it emphasis characters and table
+  # alignment.
+  #
+  # pre-commit/mirrors-prettier is archived; rbubley's is the maintained fork.
+  - repo: https://github.com/rbubley/mirrors-prettier
+    rev: v3.9.6
+    hooks:
+      - id: prettier
+        types_or: [markdown, json, yaml]
+
   - repo: https://github.com/yadgarhq/actions
     rev: v1.0.0
     hooks:
