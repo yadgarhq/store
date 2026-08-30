@@ -4,10 +4,14 @@ name: ci
 # repository's CI configuration: the shared workflows detect what the repository
 # is — Cargo.toml, buf.yaml, chart/, Dockerfile — and run what applies.
 #
-# Pinned to @v1, which is additive-only. Third-party actions are pinned by SHA
-# inside the shared workflows because a tag someone else owns can move; @v1 is
-# ours and moving it deliberately is how 70-odd repositories get an upgrade
-# without 70-odd edits.
+# Tracks @main. A fix to a shared workflow reaches every repository the moment it
+# merges, with nothing to remember afterwards — the failure mode of a moving
+# version tag is fixing a bug and forgetting to move the tag, so the fix ships to
+# nobody. What makes this safe is not a tag but that yadgarhq/actions tests its
+# own workflows and protects main.
+#
+# Third-party actions inside those workflows stay pinned by SHA: a tag somebody
+# else owns can move without warning, and this is not the same trust decision.
 on:
   pull_request:
   push:
@@ -20,10 +24,10 @@ permissions:
 jobs:
   pr:
     if: github.event_name == 'pull_request'
-    uses: yadgarhq/actions/.github/workflows/ci-pr.yml@v1
+    uses: yadgarhq/actions/.github/workflows/ci-pr.yml@main
 
   # Direct pushes to main still get validated. The repository is pushed to
   # directly, so gating only on pull requests would gate almost nothing.
   validation:
     if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
-    uses: yadgarhq/actions/.github/workflows/ci-validation.yml@v1
+    uses: yadgarhq/actions/.github/workflows/ci-validation.yml@main
