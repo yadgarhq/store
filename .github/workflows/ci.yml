@@ -1,33 +1,40 @@
 name: ci
 
 # CI is defined once in yadgarhq/actions (D62). This file is the whole of this
-# repository's CI configuration: the shared workflows detect what the repository
-# is — Cargo.toml, buf.yaml, chart/, Dockerfile — and run what applies.
+# repository's CI configuration: the shared workflow detects what the repository
+# is and runs what applies.
 #
-# Tracks @main. A fix to a shared workflow reaches every repository the moment it
-# merges, with nothing to remember afterwards — the failure mode of a moving
-# version tag is fixing a bug and forgetting to move the tag, so the fix ships to
-# nobody. What makes this safe is not a tag but that yadgarhq/actions tests its
-# own workflows and protects main.
+# The weekly schedule is not redundant with the pull request run. Callers track
+# @main, so a repository never revalidates when a shared workflow changes or a
+# new advisory lands — the schedule is what notices. Push to main runs the
+# version report only; validating there would re-run what the pull request just
+# passed, on code already merged, with nobody watching.
 #
-# Third-party actions inside those workflows stay pinned by SHA: a tag somebody
-# else owns can move without warning, and this is not the same trust decision.
+# TWO jobs rather than one, and it is a permissions boundary rather than a style
+# choice: publishing needs packages: write and id-token: write, and a single job
+# would grant both on every pull request.
 on:
   pull_request:
   push:
     branches: [main]
     tags: ["v*"]
+  schedule:
+    - cron: "0 5 * * 1"
 
 permissions:
   contents: read
 
 jobs:
-  pr:
-    if: github.event_name == 'pull_request'
-    uses: yadgarhq/actions/.github/workflows/ci-pr.yml@main
+  ci:
+    if: "!startsWith(github.ref, 'refs/tags/')"
+    uses: yadgarhq/actions/.github/workflows/ci.yml@main
 
-  # Direct pushes to main still get validated. The repository is pushed to
-  # directly, so gating only on pull requests would gate almost nothing.
-  validation:
-    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
-    uses: yadgarhq/actions/.github/workflows/ci-validation.yml@main
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: yadgarhq/actions/.github/workflows/ci-release.yml@main
+    with:
+      version: ${{ github.ref_name }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
