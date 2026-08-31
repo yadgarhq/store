@@ -17,6 +17,20 @@
   worth keeping.
 -->
 
+## Changelog
+
+<!--
+  Conventional Commits bullets, ONE PER LINE — every line under this heading is
+  parsed, so a wrapped bullet fails. Examples:
+
+    - feat: return partial results when one provider is unhealthy
+    - fix: a metadata leak in the audit relay
+    - feat!: drop the by-name arm of GetWikiPage
+
+  `!` marks a breaking change and implies a major bump; `feat:` implies minor,
+  everything else patch. The highest bullet wins.
+-->
+
 ## Verification
 
 <!--
