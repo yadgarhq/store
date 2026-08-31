@@ -23,6 +23,21 @@ use crate::credentials::Secret;
 /// log in to diagnose why nothing else can.
 const OPERATOR_RESERVE: u32 = 5;
 
+/// The smallest pool that can migrate itself.
+///
+/// [`crate::migrate::apply`] holds the cluster-wide migration lock on ONE
+/// connection — MariaDB ties `GET_LOCK` to a connection, which is the property
+/// that stops a killed replica stranding it — while the migrations themselves
+/// run on a SECOND. A pool of one therefore waits for a connection it is itself
+/// holding.
+///
+/// Measured before this floor existed: boot hung for 30.0s and then failed with
+/// "pool timed out while waiting for an open connection", which names the pool
+/// and not the cause. Only 0 was rejected, so 1 passed the headroom check and
+/// failed half a minute later, one layer away from the reason. Refusing at boot
+/// with a message that says *migration lock* is the whole fix.
+const MIN_CONNECTIONS: u32 = 2;
+
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub host: String,
@@ -69,8 +84,11 @@ impl PoolConfig {
 
     /// Refuse a configuration whose replicas would exhaust the engine.
     pub fn check_engine_headroom(&self) -> Result<(), PoolError> {
-        if self.max_connections == 0 {
-            return Err(PoolError::InvalidSize { max_connections: 0 });
+        if self.max_connections < MIN_CONNECTIONS {
+            return Err(PoolError::InvalidSize {
+                max_connections: self.max_connections,
+                minimum: MIN_CONNECTIONS,
+            });
         }
 
         let requested = self.max_connections.saturating_mul(self.replicas.max(1));
@@ -146,6 +164,13 @@ pub enum PoolError {
         reserved: u32,
     },
 
-    #[error("max_connections is {max_connections}; a pool that cannot connect is not a pool")]
-    InvalidSize { max_connections: u32 },
+    #[error(
+        "max_connections is {max_connections}; a pool needs at least {minimum}. \
+         Zero cannot connect at all, and one deadlocks on its own migration: \
+         `migrate::apply` holds the migration lock on one connection while the \
+         migrations run on a second. Refusing at boot, because the alternative \
+         is a 30-second hang ending in 'pool timed out while waiting for an open \
+         connection' — which names the pool rather than the cause."
+    )]
+    InvalidSize { max_connections: u32, minimum: u32 },
 }

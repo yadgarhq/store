@@ -68,6 +68,13 @@ The failure this prevents does not look like a configuration error. It looks lik
 intermittent "too many connections" under load, on whichever service connects
 last, and scaling up makes it worse.
 
+The same check enforces a FLOOR of two connections, and that one is not about
+load at all: `migrate::apply` holds the migration lock on one connection while
+the migrations run on a second, so a pool of one waits for a connection it is
+itself holding. Measured before the floor existed — boot hung for 30.0s and then
+failed with "pool timed out while waiting for an open connection", which names
+the pool rather than the cause.
+
 ### Migrations refuse a database ahead of the binary
 
 The deployment that matters is a rollback: the database sits at version 5 while

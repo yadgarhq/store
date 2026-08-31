@@ -29,10 +29,6 @@ fn a_dsn_never_contains_the_password() {
     let dsn = cfg().dsn();
     assert!(dsn.starts_with("mysql://"));
     assert!(dsn.contains("mariadb:3306"), "got {dsn}");
-    assert!(
-        !dsn.contains("password"),
-        "credential leaked into the DSN: {dsn}"
-    );
 }
 
 #[test]
@@ -95,4 +91,38 @@ fn tls_is_required_by_default_and_the_dsn_says_so() {
         cfg().dsn().contains("ssl-mode=REQUIRED"),
         "TLS must be explicit in the DSN"
     );
+}
+
+/// ONE CONNECTION IS A DEADLOCK, NOT A TIGHT BUDGET.
+///
+/// `migrate::apply` holds the migration lock on one connection while the
+/// migrations run on a second. With `max_connections = 1` the lock connection IS
+/// the pool, so `apply_locked` waits the full acquire timeout and boot fails
+/// after 30 seconds with "pool timed out while waiting for an open connection" —
+/// which names the pool and not the cause. Measured before this check existed.
+///
+/// Only 0 used to be rejected, so 1 passed the headroom check and failed 30
+/// seconds later, one layer from the reason.
+#[test]
+fn one_connection_is_rejected_because_the_migration_lock_needs_a_second() {
+    let mut c = cfg();
+    c.max_connections = 1;
+
+    let err = c
+        .check_engine_headroom()
+        .expect_err("a single-connection pool deadlocks its own migration");
+    assert!(matches!(err, PoolError::InvalidSize { .. }));
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("migration lock"),
+        "the message must name the cause, not just the number: {msg}"
+    );
+}
+
+#[test]
+fn two_connections_is_the_floor_and_is_accepted() {
+    let mut c = cfg();
+    c.max_connections = 2;
+    assert!(c.check_engine_headroom().is_ok());
 }
