@@ -158,6 +158,37 @@ const LOCK: &str = "yadgar_migrate";
 /// deadlock surfaces as a boot failure rather than a pod hanging in Running.
 const LOCK_TIMEOUT_SECS: i32 = 60;
 
+/// Which lock to take, and how long to wait for it.
+///
+/// The two values above are the defaults every service uses, and
+/// [`apply`] is still the whole API for them. This struct exists so the
+/// FAILURE branches can be tested at all: `LockUnavailable` is reachable only
+/// when another connection already holds the lock, which means a test must wait
+/// out the timeout — 60 seconds — and must not collide with the one lock name
+/// every other test in the suite is also taking, since `GET_LOCK` is
+/// server-wide rather than per-database.
+///
+/// Untestable-by-construction is how the branch that refuses concurrent
+/// migration ended up with zero coverage while being the thing standing between
+/// two replicas and a corrupted schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockOptions {
+    /// Server-wide `GET_LOCK` name. Every replica of a module must use the
+    /// same one, or they do not serialise against each other.
+    pub name: String,
+    /// Seconds to wait before giving up and failing the boot.
+    pub timeout_secs: i32,
+}
+
+impl Default for LockOptions {
+    fn default() -> Self {
+        Self {
+            name: LOCK.to_string(),
+            timeout_secs: LOCK_TIMEOUT_SECS,
+        }
+    }
+}
+
 /// Apply everything pending, in order, and return the version now applied.
 ///
 /// **One migration, one transaction.** Not one transaction for the whole set:
@@ -167,13 +198,26 @@ const LOCK_TIMEOUT_SECS: i32 = 60;
 /// is the honest unit — a failure leaves earlier migrations applied and recorded,
 /// which is recoverable because the ledger says exactly where it stopped.
 pub async fn apply(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, MigrationError> {
+    apply_with(pool, set, &LockOptions::default()).await
+}
+
+/// [`apply`], with the lock's name and timeout supplied rather than defaulted.
+///
+/// Services call [`apply`]. This exists so the lock's failure branches are
+/// reachable from a test without a sixty-second wait and without every test in
+/// the suite contending on one server-wide name.
+pub async fn apply_with(
+    pool: &MySqlPool,
+    set: &MigrationSet,
+    lock: &LockOptions,
+) -> Result<u64, MigrationError> {
     // SERIALISE ACROSS REPLICAS, and this is not belt-and-braces.
     //
     // D55 requires at least two replicas and both start at once. Without this
     // lock both read `applied = 0`, both run migration 1, one wins and the other
     // dies on "Table 'x' already exists" — then crash-loops, because a failed
     // migration is a failed boot. Observed on the first real two-replica deploy
-    // of task-db, and reproduced in tests/engine.rs. A single process cannot
+    // of task-db, and reproduced in tests/engine_migrate.rs. A single process cannot
     // exhibit it, which is the entire argument for D55.
     //
     // A transaction would not have helped: MariaDB commits implicitly on DDL, so
@@ -183,15 +227,15 @@ pub async fn apply(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, Migratio
     // so a replica killed mid-migration cannot strand it.
     let mut lock_conn = pool.acquire().await.map_err(MigrationError::engine)?;
     let acquired: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, ?)")
-        .bind(LOCK)
-        .bind(LOCK_TIMEOUT_SECS)
+        .bind(&lock.name)
+        .bind(lock.timeout_secs)
         .fetch_one(&mut *lock_conn)
         .await
         .map_err(MigrationError::engine)?;
 
     if acquired != Some(1) {
         return Err(MigrationError::LockUnavailable {
-            seconds: LOCK_TIMEOUT_SECS,
+            seconds: lock.timeout_secs,
         });
     }
 
@@ -200,7 +244,7 @@ pub async fn apply(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, Migratio
     // Released explicitly rather than left to the connection dropping, so the
     // next replica proceeds immediately instead of waiting on pool recycling.
     let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-        .bind(LOCK)
+        .bind(&lock.name)
         .execute(&mut *lock_conn)
         .await;
 

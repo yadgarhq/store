@@ -4,7 +4,7 @@
 //! quietly loses vector search returns worse answers rather than an error, and
 //! nothing surfaces it.
 
-use yadgar_store::capability::{Capability, CapabilityError, CapabilitySet};
+use yadgar_store::capability::{Capability, CapabilityError, CapabilitySet, Determination};
 
 #[test]
 fn satisfied_when_engine_has_everything_required() {
@@ -52,4 +52,79 @@ fn an_engine_may_exceed_what_is_required() {
     let engine = CapabilitySet::from([Capability::Transactions, Capability::Vector]);
     let required = CapabilitySet::from([Capability::Transactions]);
     assert!(engine.satisfies(&required).is_ok());
+}
+
+/// A CAPABILITY MUST BE MARKABLE ABSENT BY A LATER PASS.
+///
+/// `probe::run` documents a two-pass flow — function probes before migrations,
+/// index-dependent probes after — and both passes write into one report. If the
+/// first pass records a capability present and the second finds it absent, the
+/// report that reaches `satisfies` must say ABSENT. Anything else boots a module
+/// against an engine that cannot serve it, which is precisely the silent
+/// degradation D7 refuses.
+#[test]
+fn a_later_pass_may_mark_a_capability_absent() {
+    let mut report = yadgar_store::capability::CapabilityReport::default();
+    report.record(Capability::Vector, true, Determination::Probed);
+    report.record(
+        Capability::Vector,
+        false,
+        Determination::Asserted {
+            observed_version: "11.8.8-MariaDB".into(),
+            conclusion: "the index the second pass needs was never created".into(),
+            source: "second pass".into(),
+        },
+    );
+
+    assert!(
+        !report.offers(Capability::Vector),
+        "the later determination must win, or a gap boots as a pass"
+    );
+    assert!(
+        !report.offered().contains(Capability::Vector),
+        "the offered set must agree with offers()"
+    );
+    assert!(
+        matches!(
+            report.determination(Capability::Vector),
+            Some(Determination::Asserted { .. })
+        ),
+        "determination must report the SECOND record, not a stale one: {:?}",
+        report.determination(Capability::Vector)
+    );
+    report
+        .satisfies(&CapabilitySet::from([Capability::Vector]))
+        .expect_err("a module requiring an absent capability must fail to boot");
+}
+
+/// The same in the other order. A capability found absent by the first pass and
+/// present by the second — an index-dependent probe that only becomes
+/// answerable after migrations — must end up present, and once.
+#[test]
+fn a_later_pass_may_mark_a_capability_present() {
+    let mut report = yadgar_store::capability::CapabilityReport::default();
+    report.record(Capability::Vector, false, Determination::Probed);
+    report.record(
+        Capability::Vector,
+        true,
+        Determination::Asserted {
+            observed_version: "11.8.8-MariaDB".into(),
+            conclusion: "the index exists once migrations have run".into(),
+            source: "second pass".into(),
+        },
+    );
+
+    assert!(report.offers(Capability::Vector), "the later pass wins");
+    assert!(report.offered().contains(Capability::Vector));
+    assert!(
+        matches!(
+            report.determination(Capability::Vector),
+            Some(Determination::Asserted { .. })
+        ),
+        "determination must report the SECOND record: {:?}",
+        report.determination(Capability::Vector)
+    );
+    report
+        .satisfies(&CapabilitySet::from([Capability::Vector]))
+        .expect("the capability is present, so the module boots");
 }

@@ -176,10 +176,30 @@ pub struct CapabilityReport {
 }
 
 impl CapabilityReport {
+    /// Record one determination. **The LATER call wins**, and a capability
+    /// recorded present and then absent ends up absent.
+    ///
+    /// Last-write-wins rather than a hard error on a conflicting re-record,
+    /// because [`crate::probe`] documents a two-pass flow — function probes
+    /// before migrations, index-dependent probes after — that accumulates both
+    /// passes into ONE report through this method. Refusing the second write
+    /// would make that flow impossible without a merge API this crate does not
+    /// have, so the ordering is the contract instead: the passes run in a stated
+    /// order, and the last one to look is the one that saw the finished engine.
+    ///
+    /// Removing from the opposite map is the load-bearing half. Leaving a stale
+    /// entry in `offered` made [`Self::offers`] answer true for a capability the
+    /// second pass had just found missing, so `satisfies` returned `Ok` and the
+    /// module booted against an engine that cannot serve it — exactly the silent
+    /// degradation D7 refuses. A stale entry in `absent` is quieter but the same
+    /// class: [`Self::determination`] would report the superseded provenance in
+    /// the boot error, and provenance is what D69 is for.
     pub fn record(&mut self, cap: Capability, present: bool, how: Determination) {
         if present {
+            self.absent.remove(&cap);
             self.offered.insert(cap, how);
         } else {
+            self.offered.remove(&cap);
             self.absent.insert(cap, how);
         }
     }

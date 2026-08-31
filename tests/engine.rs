@@ -1,94 +1,19 @@
-//! The half of `yadgar-store` that talks to an engine.
+//! The pool, against a real engine.
 //!
 //! Same rule as `probe.rs`: no engine, no run — these panic rather than skip,
 //! because the logic around a gap passing while the gap itself is untested is
-//! the exact state this crate was in before (D69, D55).
+//! the exact state this crate was in before (D69, D55). Migrations and the
+//! backup census have their own files; the shared setup is in
+//! `tests/common/mod.rs`.
 
+mod common;
+
+use common::{config_and_secret, scratch, scratch_pool};
 use yadgar_store::credentials::Secret;
-use yadgar_store::migrate::{Migration, MigrationSet};
-use yadgar_store::pool::PoolConfig;
-use yadgar_store::{backup, migrate};
-
-fn dsn() -> String {
-    std::env::var("YADGAR_TEST_DSN").unwrap_or_else(|_| {
-        panic!(
-            "YADGAR_TEST_DSN is unset. These tests assert what a real MariaDB \
-             does; running them without one reports success while proving \
-             nothing. See tests/probe.rs for the podman one-liner."
-        )
-    })
-}
-
-/// Parse the test DSN into a config plus its secret, so the pool constructor is
-/// exercised through the same path a service uses.
-fn config_and_secret(db: &str) -> (PoolConfig, Secret) {
-    let url = dsn();
-    let rest = url.trim_start_matches("mysql://");
-    let (creds, hostpart) = rest.split_once('@').expect("dsn needs user:pass@host");
-    let (user, pass) = creds.split_once(':').expect("dsn needs a password");
-    let hostport = hostpart.split('/').next().unwrap();
-    let (host, port) = hostport.split_once(':').expect("dsn needs a port");
-
-    (
-        PoolConfig {
-            host: host.to_string(),
-            port: port.parse().expect("port"),
-            database: db.to_string(),
-            username: user.to_string(),
-            max_connections: 4,
-            replicas: 2,
-            engine_max_connections: 151,
-            // The CI service container speaks plaintext on loopback; D58's TLS
-            // requirement is asserted by pool.rs's own unit tests, which check
-            // the DSN says so. Turning it on here would test the container's
-            // certificate setup, not this crate.
-            require_tls: false,
-        },
-        Secret::new(pass.to_string()),
-    )
-}
-
-async fn scratch(name: &str) -> PoolConfig {
-    use sqlx::Connection;
-    let mut root = sqlx::MySqlConnection::connect(&dsn())
-        .await
-        .expect("connect");
-    for stmt in [
-        format!("DROP DATABASE IF EXISTS {name}"),
-        format!("CREATE DATABASE {name}"),
-    ] {
-        // AUDIT: `name` is a literal in this file, not input.
-        sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
-            .execute(&mut root)
-            .await
-            .expect("ddl");
-    }
-    config_and_secret(name).0
-}
-
-fn migrations() -> MigrationSet {
-    MigrationSet::new(vec![
-        Migration {
-            version: 1,
-            name: "create_thing".into(),
-            sql: "CREATE TABLE thing (id INT PRIMARY KEY)".into(),
-        },
-        Migration {
-            version: 2,
-            name: "add_label".into(),
-            sql: "ALTER TABLE thing ADD COLUMN label TEXT".into(),
-        },
-    ])
-    .expect("valid set")
-}
 
 #[tokio::test]
 async fn the_pool_connects_with_a_resolved_credential() {
-    let cfg = scratch("ys_pool").await;
-    let (_, secret) = config_and_secret("ys_pool");
-    let pool = yadgar_store::pool::connect(&cfg, &secret)
-        .await
-        .expect("pool should connect");
+    let pool = scratch_pool("ys_pool").await;
     let one: i64 = sqlx::query_scalar("SELECT 1")
         .fetch_one(&pool)
         .await
@@ -109,164 +34,71 @@ async fn connect_refuses_a_config_that_would_exhaust_the_engine() {
         .expect_err("1000 connections against 151 must be refused before connecting");
 }
 
-#[tokio::test]
-async fn migrations_apply_in_order_and_exactly_once() {
-    let cfg = scratch("ys_migrate").await;
-    let (_, secret) = config_and_secret("ys_migrate");
-    let pool = yadgar_store::pool::connect(&cfg, &secret)
-        .await
-        .expect("pool");
-
-    let applied = migrate::apply(&pool, &migrations()).await.expect("apply");
-    assert_eq!(applied, 2, "both migrations should apply");
-
-    // Column from migration 2 exists, so ordering held.
-    sqlx::query("SELECT id, label FROM thing")
-        .fetch_optional(&pool)
-        .await
-        .expect("migration 2 must have run after migration 1");
-
-    let again = migrate::apply(&pool, &migrations())
-        .await
-        .expect("re-apply");
-    assert_eq!(again, 2, "a second run applies nothing new");
-}
-
-/// The rollback case: the database is ahead of this binary. Silently treating
-/// that as "nothing pending" runs old code on a newer schema.
-#[tokio::test]
-async fn a_database_ahead_of_the_binary_refuses_to_boot() {
-    let cfg = scratch("ys_ahead").await;
-    let (_, secret) = config_and_secret("ys_ahead");
-    let pool = yadgar_store::pool::connect(&cfg, &secret)
-        .await
-        .expect("pool");
-
-    migrate::apply(&pool, &migrations()).await.expect("apply");
-
-    let older = MigrationSet::new(vec![Migration {
-        version: 1,
-        name: "create_thing".into(),
-        sql: "CREATE TABLE thing (id INT PRIMARY KEY)".into(),
-    }])
-    .expect("valid");
-
-    let err = migrate::apply(&pool, &older)
-        .await
-        .expect_err("an older binary must refuse a newer schema");
-    assert!(
-        err.to_string().contains("newer version"),
-        "the error must say what is wrong: {err}"
-    );
-}
-
-/// D6: a backup nobody has restored is a hypothesis. The counting half is what
-/// turns `RestoreReport` from a struct into a measurement.
-#[tokio::test]
-async fn row_counts_come_from_the_engine_and_verify() {
-    let cfg = scratch("ys_backup").await;
-    let (_, secret) = config_and_secret("ys_backup");
-    let pool = yadgar_store::pool::connect(&cfg, &secret)
-        .await
-        .expect("pool");
-    migrate::apply(&pool, &migrations()).await.expect("apply");
-
-    sqlx::raw_sql("INSERT INTO thing (id) VALUES (1), (2), (3)")
-        .execute(&pool)
-        .await
-        .expect("seed");
-
-    let census = backup::census(&pool, "ys_backup").await.expect("census");
-    // 3 seeded rows + 2 rows in the migration ledger. The ledger IS counted,
-    // deliberately: it is part of the database, and a restore that dropped it
-    // would leave the schema unversioned while looking healthy. Excluding
-    // "our own" tables from a verification is how a verification stops
-    // verifying.
-    assert_eq!(
-        census.rows, 5,
-        "three seeded rows plus the migration ledger"
-    );
-    assert_eq!(census.tables, 2, "thing and the migration ledger");
-
-    let report = backup::RestoreReport {
-        rows_backed_up: census.rows,
-        rows_restored: census.rows,
-        tables: census.tables,
-    };
-    assert!(
-        matches!(report.verify(), backup::VerifyOutcome::Verified),
-        "equal counts over real tables must verify"
-    );
-}
-
-/// The 2026-06-16 shape: the check passed and the rows were gone. Counts taken
-/// from a real engine must catch it.
-#[tokio::test]
-async fn a_restore_that_lost_rows_fails_verification() {
-    let cfg = scratch("ys_lost").await;
-    let (_, secret) = config_and_secret("ys_lost");
-    let pool = yadgar_store::pool::connect(&cfg, &secret)
-        .await
-        .expect("pool");
-    migrate::apply(&pool, &migrations()).await.expect("apply");
-    sqlx::raw_sql("INSERT INTO thing (id) VALUES (1), (2), (3)")
-        .execute(&pool)
-        .await
-        .expect("seed");
-
-    let before = backup::census(&pool, "ys_lost").await.expect("census");
-    sqlx::raw_sql("DELETE FROM thing WHERE id > 1")
-        .execute(&pool)
-        .await
-        .expect("simulate a lossy restore");
-    let after = backup::census(&pool, "ys_lost").await.expect("census");
-
-    let report = backup::RestoreReport {
-        rows_backed_up: before.rows,
-        rows_restored: after.rows,
-        tables: after.tables,
-    };
-    assert!(
-        matches!(report.verify(), backup::VerifyOutcome::Failed(_)),
-        "3 backed up, 1 restored: this is the incident, and it must fail"
-    );
-}
-
-/// THE REPLICA RACE, reproduced.
+/// THE 30-SECOND BOOT FAILURE, refused up front.
 ///
-/// Two replicas boot at once against one database, both read `applied = 0`, and
-/// both try migration 1. Before the migration lock, one won and the other died
-/// on "Table 'task' already exists" — then crash-looped, because a failed
-/// migration is a failed boot. Observed on the first real two-replica deploy.
+/// `migrate::apply` holds the migration lock on one connection while the
+/// migrations run on a second, so a pool of one waits for a connection it is
+/// itself holding. Before the floor in `check_engine_headroom`, only 0 was
+/// rejected: `max_connections = 1` connected happily, then boot hung for 30.0s
+/// and failed with "pool timed out while waiting for an open connection", which
+/// names the pool and not the cause.
 ///
-/// A single process cannot exhibit this, which is the whole argument for D55.
+/// The timing assertion is the point. Refusing eventually is what it already
+/// did; refusing IMMEDIATELY, with the reason, is the fix.
 #[tokio::test]
-async fn concurrent_replicas_do_not_race_on_migrations() {
-    let cfg = scratch("ys_race").await;
-    let (_, secret) = config_and_secret("ys_race");
+async fn a_single_connection_pool_is_refused_at_once_not_thirty_seconds_later() {
+    let mut cfg = scratch("ys_one_conn").await;
+    let (_, secret) = config_and_secret("ys_one_conn");
+    cfg.max_connections = 1;
 
-    // Two pools, as two replicas would have.
-    let a = yadgar_store::pool::connect(&cfg, &secret)
+    let started = std::time::Instant::now();
+    let err = yadgar_store::pool::connect(&cfg, &secret)
         .await
-        .expect("pool a");
-    let b = yadgar_store::pool::connect(&cfg, &secret)
+        .expect_err("one connection cannot migrate: the lock would hold the pool");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the refusal must be immediate; took {elapsed:?}, which is the pool \
+         acquire timeout rather than a check"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("migration lock"),
+        "the boot error must name the cause: {msg}"
+    );
+}
+
+/// THE ASSERTION THAT CAN ACTUALLY FAIL.
+///
+/// `tests/pool.rs` used to search the DSN for the literal word "password" —
+/// while `PoolConfig` has no password field, so no value could ever have
+/// appeared and no change to `dsn()` could ever have failed it. A test that
+/// cannot fail is worse than none: it reads as coverage.
+///
+/// The seam that CAN leak is the connect path, the only place the secret and
+/// the DSN are both in scope. So: a real engine, a deliberately wrong password,
+/// and a search of the error for the sentinel VALUE — Display and Debug both,
+/// since a `#[source]` chain reaches logs through either. The same shape as the
+/// credentials suite, which searches for "hunter2" rather than for the word
+/// "secret".
+#[tokio::test]
+async fn a_failed_connection_never_carries_the_credential_into_its_error() {
+    const SENTINEL: &str = "hunter2-do-not-leak";
+
+    let cfg = scratch("ys_leak").await;
+    let err = yadgar_store::pool::connect(&cfg, &Secret::new(SENTINEL.into()))
         .await
-        .expect("pool b");
+        .expect_err("a wrong password must be refused by the engine");
 
-    let (ma, mb) = (migrations(), migrations());
-    let (ra, rb) = tokio::join!(migrate::apply(&a, &ma), migrate::apply(&b, &mb));
-
-    // BOTH must succeed. One migrates, the other waits and finds the ledger
-    // already current — neither may fail, because a failing replica crash-loops.
-    let va = ra.expect("replica a must not fail");
-    let vb = rb.expect("replica b must not fail");
-    assert_eq!(va, 2);
-    assert_eq!(vb, 2);
-
-    // And the work happened exactly once: two rows, not four.
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM yadgar_schema_migrations")
-        .fetch_one(&a)
-        .await
-        .expect("count");
-    assert_eq!(rows, 2, "each migration must be recorded exactly once");
+    let display = err.to_string();
+    let debug = format!("{err:?}");
+    assert!(
+        !display.contains(SENTINEL),
+        "credential leaked into the error message: {display}"
+    );
+    assert!(
+        !debug.contains(SENTINEL),
+        "credential leaked into Debug: {debug}"
+    );
 }
