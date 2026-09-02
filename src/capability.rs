@@ -217,6 +217,25 @@ impl CapabilityReport {
         self.offered.keys().copied().collect()
     }
 
+    /// What this engine was found to LACK.
+    ///
+    /// The mirror of [`Self::offered`], and it exists because without it half of
+    /// [`Self::record`] had no observer. `record` removes from the opposite map
+    /// on every write, and on a PRESENT write nothing could see whether the
+    /// `absent` removal happened: [`Self::determination`] consults `offered`
+    /// first, so a superseded entry left in `absent` is invisible to it, and
+    /// [`Self::offers`] never reads that map at all. Deleting the removal left
+    /// every test in this crate green.
+    ///
+    /// What a stale entry then costs is the thing D69 is for. The provenance a
+    /// boot failure prints comes from [`Self::determination`], so a capability
+    /// the second pass established as PRESENT would still carry the first pass's
+    /// "absent" reasoning the moment `offered` stopped answering — a documented
+    /// belief presented as this engine's current state.
+    pub fn absent(&self) -> CapabilitySet {
+        self.absent.keys().copied().collect()
+    }
+
     /// Check against what a module requires, reporting **every** gap with the
     /// provenance of each.
     pub fn satisfies(&self, required: &CapabilitySet) -> Result<(), CapabilityError> {

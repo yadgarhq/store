@@ -85,6 +85,10 @@ fn a_later_pass_may_mark_a_capability_absent() {
         "the offered set must agree with offers()"
     );
     assert!(
+        report.absent().contains(Capability::Vector),
+        "and the absent set must carry it, or the gap has no provenance to print"
+    );
+    assert!(
         matches!(
             report.determination(Capability::Vector),
             Some(Determination::Asserted { .. })
@@ -116,6 +120,18 @@ fn a_later_pass_may_mark_a_capability_present() {
 
     assert!(report.offers(Capability::Vector), "the later pass wins");
     assert!(report.offered().contains(Capability::Vector));
+    // THE ASSERTION THAT WATCHES THE OTHER MAP, and the reason `absent()`
+    // exists. `record`'s present branch removes the capability from `absent`,
+    // and until this line nothing observed that: `offers` never reads `absent`,
+    // and `determination` reads `offered` first and finds the fresh entry there.
+    // Deleting `self.absent.remove(&cap)` left the whole suite green while the
+    // report held both a "present" and a superseded "absent" determination for
+    // one capability — so the provenance printed for a gap could be a belief the
+    // second pass had already overturned.
+    assert!(
+        !report.absent().contains(Capability::Vector),
+        "the superseded absent entry must be removed, not merely shadowed"
+    );
     assert!(
         matches!(
             report.determination(Capability::Vector),
