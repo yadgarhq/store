@@ -11,10 +11,15 @@
 //! presents as intermittent "too many connections" under load, on whichever
 //! service happens to connect last, and scaling up makes it worse.
 
-use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::MySqlPool;
 
 use crate::credentials::Secret;
+
+/// Re-exported so a `-db` binary names the transport mode through the seam that
+/// already owns connections, instead of reaching into sqlx for a type this crate
+/// is responsible for choosing.
+pub use sqlx::mysql::MySqlSslMode;
 
 /// Connections an engine keeps back for `SUPER`, so an operator can still get in
 /// when the pools have taken everything.
@@ -38,6 +43,16 @@ const OPERATOR_RESERVE: u32 = 5;
 /// with a message that says *migration lock* is the whole fix.
 const MIN_CONNECTIONS: u32 = 2;
 
+/// The mode a `-db` uses when its deployment says nothing: encrypt, and refuse
+/// to fall back.
+///
+/// A STRING rather than a [`MySqlSslMode`], so the binary's environment default,
+/// the chart's value and this crate all name one token. It is deliberately NOT
+/// `preferred`: that is sqlx's own default, and sqlx documents it as falling
+/// back to an unencrypted connection when an encrypted one cannot be
+/// established.
+pub const DEFAULT_SSL_MODE: &str = "required";
+
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub host: String,
@@ -54,9 +69,57 @@ pub struct PoolConfig {
     /// assumed.
     pub engine_max_connections: u32,
 
-    /// D58 puts every `-db` on TLS to its engine. The RUSTSEC-2023-0071
-    /// exception recorded in `deny.toml` depends on this staying true.
-    pub require_tls: bool,
+    /// How TLS is negotiated to the engine, and how far the engine's identity is
+    /// checked. D58 puts every `-db` on TLS, and the RUSTSEC-2023-0071 exception
+    /// recorded in each module's `deny.toml` depends on that staying true.
+    ///
+    /// A `bool` used to sit here, and it could express two of sqlx's five modes.
+    /// `Required` encrypts and verifies NO certificate; `VerifyCa` and
+    /// `VerifyIdentity` are the ones that check the engine is who it claims. So
+    /// an operator on a managed engine who wanted their CA verified had no value
+    /// to set — the answer was a recompile, which is what D80 forbids:
+    /// configuration is the seam.
+    ///
+    /// Build it with [`parse_ssl_mode`], which refuses what it does not
+    /// recognise.
+    pub ssl_mode: MySqlSslMode,
+}
+
+/// Parse an operator-supplied ssl-mode, refusing anything unrecognised.
+///
+/// **Refusing is the point.** The expression this replaces was
+/// `env_or("DB_REQUIRE_TLS", "true") == "true"`, under which `1`, `TRUE`,
+/// `True`, `yes` and `on` all evaluated FALSE and selected an unencrypted
+/// connection — silently, with no log line, while the operator's configuration
+/// said the opposite. A value nobody recognises is a question, and the answer to
+/// a question about transport security is not a guess.
+///
+/// Case and separator are normalised because a chart writes `verify-identity`
+/// and sqlx writes `verify_identity`. Two spellings of one mode is a trap rather
+/// than a dialect.
+pub fn parse_ssl_mode(value: &str) -> Result<MySqlSslMode, PoolError> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "disabled" => Ok(MySqlSslMode::Disabled),
+        "preferred" => Ok(MySqlSslMode::Preferred),
+        "required" => Ok(MySqlSslMode::Required),
+        "verify_ca" => Ok(MySqlSslMode::VerifyCa),
+        "verify_identity" => Ok(MySqlSslMode::VerifyIdentity),
+        _ => Err(PoolError::UnknownSslMode {
+            value: value.to_string(),
+        }),
+    }
+}
+
+/// The name sqlx itself gives a mode in a connection string, so an error message
+/// and a real DSN cannot disagree about which mode was in force.
+fn ssl_mode_name(mode: MySqlSslMode) -> &'static str {
+    match mode {
+        MySqlSslMode::Disabled => "DISABLED",
+        MySqlSslMode::Preferred => "PREFERRED",
+        MySqlSslMode::Required => "REQUIRED",
+        MySqlSslMode::VerifyCa => "VERIFY_CA",
+        MySqlSslMode::VerifyIdentity => "VERIFY_IDENTITY",
+    }
 }
 
 impl PoolConfig {
@@ -67,11 +130,7 @@ impl PoolConfig {
     /// password is one that leaks eventually — the same reasoning that makes
     /// `Secret` redact itself in `Debug`.
     pub fn dsn(&self) -> String {
-        let mode = if self.require_tls {
-            "REQUIRED"
-        } else {
-            "DISABLED"
-        };
+        let mode = ssl_mode_name(self.ssl_mode);
         format!(
             "mysql://{user}@{host}:{port}/{db}?ssl-mode={mode}",
             user = self.username,
@@ -116,20 +175,38 @@ impl PoolConfig {
 ///
 /// The credential is applied here and never in [`PoolConfig::dsn`], because a
 /// DSN reaches logs, spans and error messages.
-pub async fn connect(config: &PoolConfig, secret: &Secret) -> Result<MySqlPool, PoolError> {
-    config.check_engine_headroom()?;
-
-    let options = MySqlConnectOptions::new()
+/// The ONE description of a connection to the engine.
+///
+/// **Two code paths that must agree about TLS were the bug; one path is the
+/// fix.** D7's capability probe runs on a connection of its own, before the pool
+/// exists, and each `-db` binary used to build that connection by `format!`-ing
+/// its own string with no `ssl-mode` in it. That inherited sqlx's default —
+/// `Preferred`, which sqlx documents as "falling back to an unencrypted
+/// connection if an encrypted connection cannot be established" — while the pool
+/// beside it was on `Required`.
+///
+/// The reference deployment hid it: MariaDB behind the operator refuses
+/// plaintext, so the probe negotiated TLS anyway. On RDS or Aurora with
+/// `require_secure_transport=OFF`, on Cloud SQL without enforcement, or through
+/// a proxy that terminates, it does not — and the database password crossed the
+/// network in the clear at every pod boot, with no log line either way.
+///
+/// So the probe takes these options too, and neither caller decides anything
+/// about transport on its own.
+pub fn connect_options(config: &PoolConfig, secret: &Secret) -> MySqlConnectOptions {
+    MySqlConnectOptions::new()
         .host(&config.host)
         .port(config.port)
         .database(&config.database)
         .username(&config.username)
         .password(secret.expose())
-        .ssl_mode(if config.require_tls {
-            MySqlSslMode::Required
-        } else {
-            MySqlSslMode::Disabled
-        });
+        .ssl_mode(config.ssl_mode)
+}
+
+pub async fn connect(config: &PoolConfig, secret: &Secret) -> Result<MySqlPool, PoolError> {
+    config.check_engine_headroom()?;
+
+    let options = connect_options(config, secret);
 
     MySqlPoolOptions::new()
         .max_connections(config.max_connections)
@@ -173,4 +250,16 @@ pub enum PoolError {
          connection' — which names the pool rather than the cause."
     )]
     InvalidSize { max_connections: u32, minimum: u32 },
+
+    #[error(
+        "{value:?} is not an ssl-mode. Accepted: disabled, preferred, required, \
+         verify_ca, verify_identity. Refusing at boot rather than guessing — the \
+         expression this replaces read a boolean and treated every spelling but \
+         `true` as DISABLED, so a deployment that asked for TLS got a cleartext \
+         password on the wire and no log line either way. Of the five: \
+         `preferred` falls back to cleartext when the engine will not negotiate \
+         TLS; `required` encrypts but checks no certificate; `verify_ca` and \
+         `verify_identity` check one."
+    )]
+    UnknownSslMode { value: String },
 }

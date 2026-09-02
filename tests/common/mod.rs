@@ -15,7 +15,7 @@
 use sqlx::{Connection, MySqlConnection, MySqlPool};
 use yadgar_store::credentials::Secret;
 use yadgar_store::migrate::{Migration, MigrationSet};
-use yadgar_store::pool::PoolConfig;
+use yadgar_store::pool::{MySqlSslMode, PoolConfig};
 
 pub fn dsn() -> String {
     std::env::var("YADGAR_TEST_DSN").unwrap_or_else(|_| {
@@ -47,10 +47,11 @@ pub fn config_and_secret(db: &str) -> (PoolConfig, Secret) {
             replicas: 2,
             engine_max_connections: 151,
             // The CI service container speaks plaintext on loopback; D58's TLS
-            // requirement is asserted by pool.rs's own unit tests, which check
-            // the DSN says so. Turning it on here would test the container's
-            // certificate setup, not this crate.
-            require_tls: false,
+            // requirement is asserted by tests/pool.rs, which checks the default
+            // mode and the options the connection is actually built with.
+            // Turning it on here would test the container's certificate setup,
+            // not this crate.
+            ssl_mode: MySqlSslMode::Disabled,
         },
         Secret::new(pass.to_string()),
     )
