@@ -22,6 +22,7 @@ fn cfg() -> PoolConfig {
         replicas: 2,
         engine_max_connections: 151,
         ssl_mode: MySqlSslMode::Required,
+        ssl_ca: None,
     }
 }
 
@@ -30,6 +31,19 @@ fn cfg() -> PoolConfig {
 /// than through an operator that does not exist.
 fn mode_name(mode: MySqlSslMode) -> String {
     format!("{mode:?}")
+}
+
+/// Whether the built options carry a CA path, and WHICH one.
+///
+/// sqlx exposes `get_ssl_mode` and no `get_ssl_ca`, so the only reachable
+/// evidence that the path was handed over is the options' own `Debug`. That
+/// rendering ALSO CONTAINS THE PASSWORD — `MySqlConnectOptions` derives `Debug`
+/// over an `Option<String>` password with no redaction — so it is reduced to a
+/// yes-or-no here and NEVER put in an assertion message. A failing assertion's
+/// message reaches CI logs, which is exactly the leak `PoolConfig::dsn` exists
+/// to avoid.
+fn carries_ca(options: &sqlx::mysql::MySqlConnectOptions, path: &str) -> bool {
+    format!("{options:?}").contains(path)
 }
 
 #[test]
@@ -114,15 +128,21 @@ fn tls_is_required_by_default_and_the_dsn_says_so() {
     );
 }
 
-/// D80: configuration is the seam, and a recompile is not.
+/// D80: configuration is the seam.
 ///
 /// A `bool` used to sit where the mode does, and it could express exactly two of
 /// sqlx's five modes. `Required` encrypts and checks NO certificate; `VerifyCa`
 /// and `VerifyIdentity` are the only ones that check one. So an operator on a
-/// managed engine who wanted their CA verified had no value to set — the answer
-/// was a code change, which is what D80 forbids.
+/// managed engine had no value to set at all.
+///
+/// **THIS TEST IS ABOUT THE MODE AND NOTHING ELSE, and its name used to promise
+/// more than it asserts.** Reaching `VerifyCa` is not reaching verification: the
+/// mode has to be pointed at an authority, which is
+/// [`the CA path`](the_configured_ca_is_handed_to_sqlx) below, and until that
+/// field existed the two verifying modes checked against the public web roots —
+/// which sign no engine certificate this estate issues.
 #[test]
-fn certificate_verification_is_reachable_through_configuration() {
+fn the_verifying_modes_are_reachable_through_configuration() {
     for (written, expected) in [
         ("verify_ca", "VerifyCa"),
         ("verify_identity", "VerifyIdentity"),
@@ -228,6 +248,65 @@ fn the_probe_and_the_pool_are_built_from_one_set_of_options() {
     assert_eq!(options.get_port(), 3306);
     assert_eq!(options.get_username(), "task");
     assert_eq!(options.get_database(), Some("task"));
+}
+
+/// **A VERIFYING MODE WITH NOTHING TO VERIFY AGAINST WAS THE WHOLE DEFECT.**
+///
+/// `connect_options` chained `.ssl_mode(...)` and stopped there. `PoolConfig`
+/// carried no CA path and no `.ssl_ca(...)` call existed anywhere, so under
+/// `tls-rustls-ring` sqlx built its trust store from
+/// `webpki_roots::TLS_SERVER_ROOTS` — the public web roots, which sign no
+/// operator-issued, RDS or Aurora engine certificate. Both verifying modes
+/// therefore failed closed against every engine this estate runs, and `VerifyCa`
+/// additionally routes through sqlx's `NoHostnameTlsVerifier`, which swallows
+/// `NotValidForName`: it accepted ANY publicly-trusted certificate for ANY name.
+///
+/// So the assertion is that the CONFIGURED path reaches the connection. A mode
+/// alone is not the capability, which is what `tests/pool.rs` used to imply.
+#[test]
+fn the_configured_ca_is_handed_to_sqlx() {
+    const CA: &str = "/var/run/config/engine-ca/ca.crt";
+
+    let mut c = cfg();
+    c.ssl_mode = MySqlSslMode::VerifyCa;
+    c.ssl_ca = Some(CA.into());
+
+    let options = connect_options(&c, &Secret::new("unused".into()));
+    assert!(
+        carries_ca(&options, CA),
+        "the connection must be built with the authority the operator named; \
+         without it sqlx trusts the public web roots, which sign no engine \
+         certificate this estate issues"
+    );
+    assert_eq!(
+        mode_name(options.get_ssl_mode()),
+        "VerifyCa",
+        "naming a CA must not change the mode the operator asked for"
+    );
+}
+
+/// **NO CA IS A LEGITIMATE DEPLOYMENT, so nothing is invented for it.**
+///
+/// An engine whose authority IS a public root — Azure MySQL flexible-server is
+/// the case — needs no file, and a default path substituted here would be one
+/// sqlx tries to read and fails on. `None` must therefore reach sqlx as nothing
+/// at all rather than as a guess.
+///
+/// The residue this leaves is deliberate and is NOT closed here: `verify_ca`
+/// with no CA still falls back to the web roots and still skips the hostname
+/// check. Refusing that combination at boot is tempting next to
+/// `check_engine_headroom` and would break the Azure deployment above.
+#[test]
+fn no_ca_is_carried_when_none_is_configured() {
+    let mut c = cfg();
+    c.ssl_mode = MySqlSslMode::VerifyIdentity;
+    c.ssl_ca = None;
+
+    let options = connect_options(&c, &Secret::new("unused".into()));
+    assert!(
+        !carries_ca(&options, "ssl_ca: Some"),
+        "an unset CA must reach sqlx as unset, never as a path nobody configured"
+    );
 }
 
 /// `preferred` stays reachable, because refusing to name it would not remove it

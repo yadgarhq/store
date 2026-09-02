@@ -52,6 +52,10 @@ pub fn config_and_secret(db: &str) -> (PoolConfig, Secret) {
             // Turning it on here would test the container's certificate setup,
             // not this crate.
             ssl_mode: MySqlSslMode::Disabled,
+            // Nothing for a CA to verify under `Disabled`. Naming a file sqlx
+            // would never read is the kind of fixture that makes a suite look
+            // like it covers something it does not.
+            ssl_ca: None,
         },
         Secret::new(pass.to_string()),
     )
