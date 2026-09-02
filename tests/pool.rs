@@ -199,9 +199,13 @@ fn case_and_separator_do_not_change_the_mode() {
 /// with `format!` and no `ssl-mode` in it, so it inherited sqlx's default —
 /// `Preferred`, documented as "falling back to an unencrypted connection if an
 /// encrypted connection cannot be established" — while the pool beside it was on
-/// `Required`. On any engine that permits cleartext, the database password
-/// crossed the network in the clear at every pod boot, and neither side logged
-/// anything.
+/// `Required`. What that cost is the GUARANTEE rather than the password: the
+/// credential is a challenge-response scramble or an RSA-encrypted blob under
+/// every default plugin, and an engine that offers TLS will have upgraded the
+/// probe's connection anyway. But nothing required it to, so on an engine that
+/// permits cleartext the probe's whole connection — handshake, queries and
+/// results — could go unencrypted at every pod boot, with no log line either
+/// way.
 ///
 /// This asserts the one property that makes the second path impossible to get
 /// wrong: the options are built HERE, once, and the mode in them is the

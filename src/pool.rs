@@ -185,11 +185,40 @@ impl PoolConfig {
 /// connection if an encrypted connection cannot be established" — while the pool
 /// beside it was on `Required`.
 ///
-/// The reference deployment hid it: MariaDB behind the operator refuses
-/// plaintext, so the probe negotiated TLS anyway. On RDS or Aurora with
-/// `require_secure_transport=OFF`, on Cloud SQL without enforcement, or through
-/// a proxy that terminates, it does not — and the database password crossed the
-/// network in the clear at every pod boot, with no log line either way.
+/// **What was missing is the GUARANTEE, and that is worth stating precisely,
+/// because the obvious way to describe it is wrong twice over.**
+///
+/// It was not the password in cleartext. Under the default plugins the
+/// credential never crosses as itself: `mysql_native_password` and
+/// `caching_sha2_password` send a challenge-response scramble over the server's
+/// nonce, and `sha256_password` — and `caching_sha2_password` when its fast path
+/// misses — send the password RSA-encrypted under the server's public key
+/// (`sqlx-mysql`'s `AuthPlugin::scramble`). What was unguaranteed is the whole
+/// CONNECTION: handshake, queries and every row of every result.
+///
+/// Nor was it necessarily unencrypted. `Preferred` upgrades whenever the server
+/// advertises the SSL capability, and RDS or Aurora with
+/// `require_secure_transport=OFF` still OFFERS TLS — so the probe most likely
+/// did negotiate it. It is genuinely plaintext only where no TLS is offered,
+/// where a proxy terminates before the engine, or where the upgrade fails; and
+/// under `Preferred` every one of those is a silent success rather than an
+/// error. `Required` makes the same failure loud. The reference deployment hid
+/// the whole thing either way: MariaDB behind the operator refuses plaintext, so
+/// the probe negotiated TLS because the SERVER insisted, not because the client
+/// asked.
+///
+/// **What neither mode gives is the engine's identity.** `Preferred` and
+/// `Required` both set `accept_invalid_certs`, so an encrypted connection here
+/// is encrypted to whoever answered. `VerifyCa` and `VerifyIdentity` are the
+/// modes that check, which is why [`PoolConfig::ssl_mode`] is configuration
+/// rather than a `bool`.
+///
+/// **The consequence the `deny.toml` exception rests on is unchanged.**
+/// `sqlx-mysql`'s `encrypt_rsa` — the RUSTSEC-2023-0071 path — opens with
+/// `if stream.is_tls { return Ok(to_asciz(password)) }`, so over TLS the RSA
+/// exchange never happens. That holds for a connection that IS TLS, and fails
+/// for one that fell back, which is the whole reason `DEFAULT_SSL_MODE` is
+/// `required` rather than `preferred`.
 ///
 /// So the probe takes these options too, and neither caller decides anything
 /// about transport on its own.
@@ -255,8 +284,8 @@ pub enum PoolError {
         "{value:?} is not an ssl-mode. Accepted: disabled, preferred, required, \
          verify_ca, verify_identity. Refusing at boot rather than guessing — the \
          expression this replaces read a boolean and treated every spelling but \
-         `true` as DISABLED, so a deployment that asked for TLS got a cleartext \
-         password on the wire and no log line either way. Of the five: \
+         `true` as DISABLED, so a deployment that asked for TLS got an \
+         unencrypted connection and no log line either way. Of the five: \
          `preferred` falls back to cleartext when the engine will not negotiate \
          TLS; `required` encrypts but checks no certificate; `verify_ca` and \
          `verify_identity` check one."
