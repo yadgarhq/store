@@ -135,14 +135,22 @@ fn tls_is_required_by_default_and_the_dsn_says_so() {
 /// and `VerifyIdentity` are the only ones that check one. So an operator on a
 /// managed engine had no value to set at all.
 ///
-/// **THIS TEST IS ABOUT THE MODE AND NOTHING ELSE, and its name used to promise
-/// more than it asserts.** Reaching `VerifyCa` is not reaching verification: the
-/// mode has to be pointed at an authority, which is
-/// [`the CA path`](the_configured_ca_is_handed_to_sqlx) below, and until that
-/// field existed the two verifying modes checked against the public web roots —
-/// which sign no engine certificate this estate issues.
+/// **THIS TEST IS ABOUT THE PARSER AND NOTHING ELSE, and its name has now
+/// promised too much twice.** It first claimed a verification that no CA was
+/// pointed at. It then claimed that pointing a CA at `verify_ca` was the missing
+/// half — and that is false: sqlx seeds the trust store with the public web
+/// roots before appending the CA, so `verify_ca` accepts any publicly-trusted
+/// certificate for any name however it is configured. `verify_ca` is therefore
+/// refused when a connection is built.
+///
+/// **So PARSING IS NOT CONNECTING, and this asserts only the first.**
+/// `parse_ssl_mode` still accepts `verify_ca`, deliberately: it is a token
+/// parser, it has no business knowing what a TLS backend can do, and refusing
+/// the token would make `UnknownSslMode`'s list of five accepted modes a lie.
+/// The refusal belongs to [`PoolConfig::check_ssl_mode`], asserted by
+/// [`the refusal test`](verify_ca_is_refused_because_it_cannot_bind_the_engines_identity).
 #[test]
-fn the_verifying_modes_are_reachable_through_configuration() {
+fn both_verifying_modes_parse_but_only_one_reaches_a_connection() {
     for (written, expected) in [
         ("verify_ca", "VerifyCa"),
         ("verify_identity", "VerifyIdentity"),
@@ -237,7 +245,7 @@ fn the_probe_and_the_pool_are_built_from_one_set_of_options() {
     // config and hardcoded either would still be green against those.
     c.ssl_mode = MySqlSslMode::VerifyIdentity;
 
-    let options = connect_options(&c, &Secret::new("unused".into()));
+    let options = connect_options(&c, &Secret::new("unused".into())).expect("verify_identity");
 
     assert_eq!(
         mode_name(options.get_ssl_mode()),
@@ -263,15 +271,19 @@ fn the_probe_and_the_pool_are_built_from_one_set_of_options() {
 ///
 /// So the assertion is that the CONFIGURED path reaches the connection. A mode
 /// alone is not the capability, which is what `tests/pool.rs` used to imply.
+///
+/// Spelled with `verify_identity` rather than `verify_ca` because `verify_ca` no
+/// longer reaches a connection at all — see
+/// [`the refusal`](verify_ca_is_refused_because_it_cannot_bind_the_engines_identity).
 #[test]
 fn the_configured_ca_is_handed_to_sqlx() {
     const CA: &str = "/var/run/config/engine-ca/ca.crt";
 
     let mut c = cfg();
-    c.ssl_mode = MySqlSslMode::VerifyCa;
+    c.ssl_mode = MySqlSslMode::VerifyIdentity;
     c.ssl_ca = Some(CA.into());
 
-    let options = connect_options(&c, &Secret::new("unused".into()));
+    let options = connect_options(&c, &Secret::new("unused".into())).expect("verify_identity");
     assert!(
         carries_ca(&options, CA),
         "the connection must be built with the authority the operator named; \
@@ -280,9 +292,118 @@ fn the_configured_ca_is_handed_to_sqlx() {
     );
     assert_eq!(
         mode_name(options.get_ssl_mode()),
-        "VerifyCa",
+        "VerifyIdentity",
         "naming a CA must not change the mode the operator asked for"
     );
+}
+
+/// **`verify_ca` CANNOT BIND THE ENGINE'S IDENTITY UNDER THIS TLS BACKEND, WITH
+/// OR WITHOUT A CA, so it is refused rather than offered.**
+///
+/// Read from the vendored crates rather than inferred. `sqlx-core 0.9.0`,
+/// `src/net/tls/tls_rustls.rs`: the non-`accept_invalid_certs` branch opens with
+/// `let mut cert_store = import_root_certs();` and only THEN appends the
+/// operator's CA. Under the `webpki-roots` feature this crate resolves to — the
+/// lockfile carries `webpki-roots` and not `rustls-native-certs` —
+/// `import_root_certs` is `RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS)`.
+/// So naming a CA WIDENS the trust set and never restricts it.
+///
+/// `sqlx-mysql 0.9.0`, `src/connection/tls.rs` then sets
+/// `accept_invalid_hostnames` for every mode except `VerifyIdentity`, which
+/// routes `VerifyCa` through `NoHostnameTlsVerifier` — and that verifier maps
+/// `CertificateError::NotValidForName` to `Ok(ServerCertVerified::assertion())`.
+///
+/// Put together: under `verify_ca` **anyone holding any publicly-trusted
+/// certificate for any name at all is accepted as the engine**. Adding the
+/// operator's own CA does not close that, because the public roots stay in the
+/// store beside it. A mode named for verification that accepts an arbitrary
+/// stranger is worse than one that refuses, because it reports success — which
+/// is the same shape as the `DB_REQUIRE_TLS` boolean this crate already deleted.
+///
+/// `verify_identity` keeps the public roots too, and that is fine: it checks the
+/// hostname, and no public authority may issue for a private, cluster-internal
+/// name. The NAME is what makes the operator's own CA the only usable signer,
+/// which is why the hostname check is the half that carries the guarantee.
+#[test]
+fn verify_ca_is_refused_because_it_cannot_bind_the_engines_identity() {
+    // BOTH arms, because the CA is exactly what does not rescue this mode.
+    for ca in [None, Some("/var/run/config/engine-ca/ca.crt".into())] {
+        let mut c = cfg();
+        c.ssl_mode = MySqlSslMode::VerifyCa;
+        c.ssl_ca = ca;
+
+        let err = connect_options(&c, &Secret::new("unused".into()))
+            .expect_err("verify_ca accepts any publicly-trusted certificate for any name");
+        assert!(matches!(err, PoolError::SslModeCannotVerify { .. }));
+
+        // The same refusal must be reachable WITHOUT a credential, so a consumer
+        // can stop while assembling its config rather than only at connect time.
+        assert!(matches!(
+            c.check_ssl_mode(),
+            Err(PoolError::SslModeCannotVerify { .. })
+        ));
+
+        let msg = err.to_string();
+        // **THE INSTRUCTION, NOT A MENTION.** Asserting only that
+        // `verify_identity` appears somewhere is a test that passes while the
+        // guidance is gone — the message names that mode three more times in
+        // passing, and deleting the sentence that tells the operator what to DO
+        // left this green when it was tried. So the assertion is the imperative
+        // itself, on the `msg.contains("migration lock")` precedent above:
+        // refusing a mode without naming the replacement reads as "no
+        // verification is available here", and the operator downgrades.
+        assert!(
+            msg.contains("Use verify_identity"),
+            "the refusal must TELL the operator which mode to use, not merely \
+             mention it: {msg}"
+        );
+        // Spelled as `ssl_mode_name` renders it, which is the spelling a DSN in
+        // an adjacent error message also carries. One mode, one rendering: two
+        // spellings across two messages is what `parse_ssl_mode` normalises away
+        // at the boundary and must not reappear inside.
+        assert!(
+            msg.to_ascii_lowercase().contains("verify_ca"),
+            "the message must quote the mode the operator asked for: {msg}"
+        );
+    }
+}
+
+/// **THE DEPLOYMENT THE PREVIOUS CHANGE WAS PROTECTING STILL WORKS.**
+///
+/// `store#14` left `verify_ca` reachable on the reasoning that refusing a
+/// verifying mode with no CA would break an engine whose authority IS a public
+/// root — Azure MySQL flexible-server. That reasoning conflated two things. The
+/// honest mode for such an engine is `verify_identity`: public roots for the
+/// chain, plus the hostname check that makes the chain mean something. It needs
+/// no CA file and is refused by nothing here.
+#[test]
+fn a_public_root_engine_still_verifies_with_no_ca_file() {
+    let mut c = cfg();
+    c.ssl_mode = MySqlSslMode::VerifyIdentity;
+    c.ssl_ca = None;
+
+    let options = connect_options(&c, &Secret::new("unused".into()))
+        .expect("verify_identity with no CA is a real deployment, not an omission");
+    assert_eq!(mode_name(options.get_ssl_mode()), "VerifyIdentity");
+}
+
+/// The non-verifying modes are untouched. `required` stays the default, and this
+/// change is a capability fix rather than a cut-over.
+#[test]
+fn the_non_verifying_modes_are_not_refused() {
+    for mode in [
+        MySqlSslMode::Disabled,
+        MySqlSslMode::Preferred,
+        MySqlSslMode::Required,
+    ] {
+        let mut c = cfg();
+        c.ssl_mode = mode;
+        assert!(
+            connect_options(&c, &Secret::new("unused".into())).is_ok(),
+            "{} is honest about checking no certificate and stays available",
+            mode_name(mode)
+        );
+    }
 }
 
 /// **NO CA IS A LEGITIMATE DEPLOYMENT, so nothing is invented for it.**
@@ -292,17 +413,19 @@ fn the_configured_ca_is_handed_to_sqlx() {
 /// sqlx tries to read and fails on. `None` must therefore reach sqlx as nothing
 /// at all rather than as a guess.
 ///
-/// The residue this leaves is deliberate and is NOT closed here: `verify_ca`
-/// with no CA still falls back to the web roots and still skips the hostname
-/// check. Refusing that combination at boot is tempting next to
-/// `check_engine_headroom` and would break the Azure deployment above.
+/// The residue this used to leave is closed by
+/// [`the refusal`](verify_ca_is_refused_because_it_cannot_bind_the_engines_identity):
+/// `verify_ca` skipped the hostname check while keeping the public web roots in
+/// the trust store, so it accepted any publicly-trusted certificate for any
+/// name. That is the mode's own property and no CA file fixed it, so the mode
+/// is refused rather than documented.
 #[test]
 fn no_ca_is_carried_when_none_is_configured() {
     let mut c = cfg();
     c.ssl_mode = MySqlSslMode::VerifyIdentity;
     c.ssl_ca = None;
 
-    let options = connect_options(&c, &Secret::new("unused".into()));
+    let options = connect_options(&c, &Secret::new("unused".into())).expect("verify_identity");
     assert!(
         !carries_ca(&options, "ssl_ca: Some"),
         "an unset CA must reach sqlx as unset, never as a path nobody configured"

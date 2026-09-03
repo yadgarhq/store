@@ -108,22 +108,35 @@ pub struct PoolConfig {
     ///
     /// **The second consequence is the one that decides the shape of this
     /// field.** `VerifyCa` routes through sqlx's `NoHostnameTlsVerifier`, which
-    /// swallows `NotValidForName` — so with no CA named it accepts ANY
-    /// publicly-trusted certificate for ANY name. A mode called `verify_ca` that
-    /// verifies neither the authority the operator meant nor the hostname is
-    /// worse than one that fails closed, because it reports success.
+    /// swallows `NotValidForName` — so it accepts ANY publicly-trusted
+    /// certificate for ANY name. A mode called `verify_ca` that verifies neither
+    /// the authority the operator meant nor the hostname is worse than one that
+    /// fails closed, because it reports success.
     ///
-    /// With a CA named, the two verifying modes differ exactly as their names
-    /// say: `verify_ca` checks the chain to THIS authority and not the hostname;
-    /// `verify_identity` checks both.
+    /// **AND SETTING THIS FIELD DOES NOT CLOSE THAT, which is why `verify_ca`
+    /// is refused rather than documented.** The paragraph above was once
+    /// written as "with no CA named", which reads as though a CA were the
+    /// missing half. It is not. `sqlx-core`'s `tls_rustls.rs` seeds the trust
+    /// store with the public web roots and only THEN appends this file, so a CA
+    /// WIDENS the trust set and never restricts it: `verify_ca` keeps accepting
+    /// any publicly-trusted certificate for any name with this field set.
+    /// [`connect_options`] refuses that mode.
+    ///
+    /// So this field's job is narrower than it first looks. It makes a
+    /// PRIVATE-CA engine REACHABLE under `verify_identity`; the hostname check
+    /// is what makes the connection SAFE. The two are separate properties, and
+    /// only the pair is a guarantee.
     ///
     /// A PATH, never a PEM in the configuration, and never an issuer-specific
     /// resource (D80). A file is what a mounted Secret, a ConfigMap and a bare
     /// VM all produce, and it is what rotates without a redeploy.
     ///
-    /// Leaving it `None` under a verifying mode is a legitimate deployment
+    /// Leaving it `None` under `verify_identity` is a legitimate deployment
     /// rather than an omission — an Azure MySQL engine whose authority IS a
-    /// public root needs no file — so it is not refused at boot.
+    /// public root needs no file — so it is not refused at boot. That
+    /// deployment is exactly why the refusal lands on the MODE and not on an
+    /// absent CA: the file is genuinely optional, and `verify_ca` is unsafe
+    /// with one or without one.
     pub ssl_ca: Option<PathBuf>,
 }
 
@@ -181,6 +194,25 @@ impl PoolConfig {
             db = self.database,
             mode = mode,
         )
+    }
+
+    /// Refuse an ssl-mode that cannot do what its name says.
+    ///
+    /// **A `PoolConfig` METHOD, beside [`PoolConfig::check_engine_headroom`],
+    /// because that is where this estate already puts a boot refusal** — and
+    /// because a consumer can then refuse while ASSEMBLING the config, before
+    /// any credential has been read. [`connect_options`] calls it too, so the
+    /// refusal holds whether or not a caller remembers; a correctness property
+    /// enforced by convention is one that holds until the first service forgets.
+    ///
+    /// Only `verify_ca` is refused. See [`connect_options`] for the measurement.
+    pub fn check_ssl_mode(&self) -> Result<(), PoolError> {
+        if matches!(self.ssl_mode, MySqlSslMode::VerifyCa) {
+            return Err(PoolError::SslModeCannotVerify {
+                mode: ssl_mode_name(self.ssl_mode),
+            });
+        }
+        Ok(())
     }
 
     /// Refuse a configuration whose replicas would exhaust the engine.
@@ -262,8 +294,17 @@ impl PoolConfig {
 /// failed closed against the estate's own engines. `VerifyCa` also routes
 /// through sqlx's `NoHostnameTlsVerifier`, which swallows `NotValidForName`, so
 /// it additionally accepted any publicly-trusted certificate for any name. With
-/// a CA named, `verify_ca` checks the chain to that authority and not the
-/// hostname, and `verify_identity` checks both.
+/// a CA named, a private-CA engine becomes reachable at all.
+///
+/// **A CA IS NOT ENOUGH ON ITS OWN EITHER, and that is what this function now
+/// refuses.** sqlx appends `ssl_ca` to a store already seeded with the public
+/// web roots, so it widens trust rather than narrowing it, and `VerifyCa` routes
+/// through `NoHostnameTlsVerifier`, which maps `NotValidForName` to a verified
+/// assertion. `verify_ca` therefore accepts any publicly-trusted certificate for
+/// any name whether or not a CA is configured. Only `verify_identity` binds the
+/// connection to a NAME — and the name is what makes a private CA the only
+/// usable signer, since no public authority may issue for a private,
+/// cluster-internal name.
 ///
 /// **The consequence the `deny.toml` exception rests on is unchanged.**
 /// `sqlx-mysql`'s `encrypt_rsa` — the RUSTSEC-2023-0071 path — opens with
@@ -274,7 +315,28 @@ impl PoolConfig {
 ///
 /// So the probe takes these options too, and neither caller decides anything
 /// about transport on its own.
-pub fn connect_options(config: &PoolConfig, secret: &Secret) -> MySqlConnectOptions {
+///
+/// **IT RETURNS A `Result` FOR THAT SAME REASON.** The refusal of `verify_ca`
+/// below has to be unescapable, and the only place both callers meet is here. A
+/// check that lived in [`connect`] alone would let the probe open its connection
+/// first, under the very verifier being refused — which is the original defect
+/// wearing a different hat.
+pub fn connect_options(
+    config: &PoolConfig,
+    secret: &Secret,
+) -> Result<MySqlConnectOptions, PoolError> {
+    // **A MODE THAT CANNOT DO WHAT ITS NAME SAYS IS NOT OFFERED.** Read from the
+    // vendored crates, not inferred: `sqlx-core 0.9.0`'s
+    // `net/tls/tls_rustls.rs` seeds the trust store with `import_root_certs()`
+    // BEFORE appending `ssl_ca`, and under the `webpki-roots` feature this crate
+    // resolves to that is `webpki_roots::TLS_SERVER_ROOTS`. Naming a CA
+    // therefore WIDENS the trust set and never restricts it. `sqlx-mysql`'s
+    // `connection/tls.rs` then routes every mode but `VerifyIdentity` through
+    // `NoHostnameTlsVerifier`, which maps `NotValidForName` to a verified
+    // assertion. Under `verify_ca` any publicly-trusted certificate for any name
+    // is accepted as the engine, with or without a CA file.
+    config.check_ssl_mode()?;
+
     let options = MySqlConnectOptions::new()
         .host(&config.host)
         .port(config.port)
@@ -286,16 +348,16 @@ pub fn connect_options(config: &PoolConfig, secret: &Secret) -> MySqlConnectOpti
     // Applied only when there is one. sqlx reads no file when `ssl_ca` is unset
     // and falls back to its own trust store — see [`PoolConfig::ssl_ca`] for why
     // that fallback is a decision rather than a default.
-    match &config.ssl_ca {
+    Ok(match &config.ssl_ca {
         Some(path) => options.ssl_ca(path),
         None => options,
-    }
+    })
 }
 
 pub async fn connect(config: &PoolConfig, secret: &Secret) -> Result<MySqlPool, PoolError> {
     config.check_engine_headroom()?;
 
-    let options = connect_options(config, secret);
+    let options = connect_options(config, secret)?;
 
     MySqlPoolOptions::new()
         .max_connections(config.max_connections)
@@ -347,11 +409,30 @@ pub enum PoolError {
          `true` as DISABLED, so a deployment that asked for TLS got an \
          unencrypted connection and no log line either way. Of the five: \
          `preferred` falls back to cleartext when the engine will not negotiate \
-         TLS; `required` encrypts but checks no certificate; `verify_ca` checks \
-         the engine's certificate chain and not its hostname; `verify_identity` \
-         checks both. The two verifying modes check against the CA named by \
-         `ssl_ca`, and against the public web roots when none is named — which \
-         sign no operator-issued, RDS or Aurora engine certificate."
+         TLS; `required` encrypts but checks no certificate; `verify_ca` names a \
+         check it does not perform and is refused when a connection is built, \
+         see SslModeCannotVerify; `verify_identity` checks the certificate \
+         chain AND the hostname, and is the only mode that binds the connection \
+         to the engine it names. A verifying mode checks against the CA named by \
+         `ssl_ca` IN ADDITION TO the public web roots, never instead of them — \
+         and those roots sign no operator-issued, RDS or Aurora engine \
+         certificate."
     )]
     UnknownSslMode { value: String },
+
+    #[error(
+        "ssl-mode {mode} cannot verify the engine's identity, so it is refused at \
+         boot rather than offered. Use verify_identity, which checks the same \
+         certificate chain AND the hostname; it needs no other change. Measured in \
+         sqlx 0.9: the trust store is seeded from the public web roots before the \
+         configured ssl_ca is appended, so naming an authority widens it and never \
+         restricts it, and every mode except verify_identity skips the hostname \
+         check. Together those accept ANY publicly-trusted certificate for ANY \
+         name as the engine — a stranger holding a certificate for their own \
+         domain passes. A CA file does not close that, which is why this refuses \
+         the mode instead of demanding one. If the engine's certificate does not \
+         carry the name being dialled, the fix is that certificate; `required` \
+         states the same real guarantee without naming a check nobody performs."
+    )]
+    SslModeCannotVerify { mode: &'static str },
 }
