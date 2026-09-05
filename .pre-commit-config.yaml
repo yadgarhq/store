@@ -23,13 +23,25 @@ repos:
   # `pre-commit autoupdate`.
 
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.2.0
+    rev: v1.13.1
     hooks:
       - id: gitleaks
       - id: prettier
       # No Containerfile here yet; the hook is a no-op until one arrives, which is
       # cheaper than remembering to add it on the day it does.
       - id: hadolint
+      # A CONSUMER IS NOT LINTED UNTIL IT REFERENCES THE HOOK, which is why this
+      # line exists rather than being inherited. This repository has a
+      # `.github/workflows/` and nothing read it: `ci-pr.yaml` installs the
+      # `actionlint` binary unconditionally and `yadgarhq/actions` publishes the
+      # hook, but publication makes a check AVAILABLE rather than switching it on
+      # (ledger 620, ADR-0577).
+      #
+      # The hook REFUSES rather than passes when actionlint's shellcheck rule
+      # class is not running: actionlint silently disables that whole class when
+      # the binary is absent, and "Passed, having checked nothing" is the defect
+      # the guard closes rather than a state this check may report.
+      - id: actionlint
       - id: cargo-fmt
       - id: cargo-clippy
       - id: cargo-deny
