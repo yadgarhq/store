@@ -44,4 +44,31 @@ repos:
       - id: actionlint
       - id: cargo-fmt
       - id: cargo-clippy
+      # LEDGER 659. `complexity` and `cargo-clippy-complexity` have been published
+      # in yadgarhq/actions since before v1.13.1 and were referenced by exactly
+      # ONE repository in the estate. A published hook nobody references gates
+      # nothing (ADR-0577), so these two were a shared ceiling in name only.
+      #
+      # ADOPTED HERE BECAUSE THIS REPOSITORY IS CLEAN, measured 2026-09-06 rather
+      # than hoped: `complexity.py` reports no file over the 500-line ceiling and
+      # no function over 120, and `cargo clippy --all-targets --all-features --
+      # -W clippy::cognitive_complexity -W clippy::too_many_arguments -D warnings`
+      # exits 0. Adopting now costs this repository nothing and is the only
+      # moment it is free. `complexity.py`'s own header makes the argument:
+      # adopting a limit once it is already breached means starting with an
+      # exemption list, which is how the limit stops meaning anything.
+      #
+      # THE ESTATE IS NOT ADOPTING THIS WHOLESALE, and that is deliberate rather
+      # than an oversight to correct later. The same measurement over the other
+      # Rust repositories found gateway 8 files and 5 functions over the
+      # ceilings, iam 7 and 5, iam-db 3 and 5, task-db 3 and 2, task 2 and 2,
+      # project-db 2 and 2, dial 1 and 0, lifecycle 1 and 0. Turning these on
+      # there blocks every commit in eight repositories, which is a ruling about
+      # a refactor budget and not a hook adoption. It is filed as one.
+      #
+      # The two are complementary and neither replaces the other: a line count
+      # cannot see nesting, and cognitive complexity cannot see a 2000-line file
+      # of short functions.
+      - id: complexity
+      - id: cargo-clippy-complexity
       - id: cargo-deny
