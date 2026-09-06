@@ -33,45 +33,50 @@
 //! `verify_identity` is the only mode under which a CA file changes an outcome,
 //! and the engine's certificate must carry a SAN matching the DSN's host.
 //!
-//! **THESE TESTS ARE `#[ignore]`, WHICH IS NOT THE SAME AS SKIPPED.** Every
-//! other engine-backed suite here panics when its fixture is absent, because CI
-//! supplies that fixture and a silent pass would be the failure D69 exists to
-//! stop. CI supplies NO private-CA engine today — the MariaDB in
-//! `yadgarhq/actions` is a service container, service containers start before
-//! any step runs, and MariaDB reads `ssl_cert`/`ssl_key` only at startup, so
-//! there is no point at which generated certificates could reach it. A panic CI
-//! cannot satisfy is not a tripwire, it is a permanently red build. `#[ignore]`
-//! keeps the non-execution STATED: every `cargo test` run in every CI log counts
-//! these in its `ignored` total, where an early `return` would hide them. The
-//! helpers below still panic once the suite is asked to run, so it cannot pass
-//! against nothing.
+//! **CI RUNS THIS SUITE, and the fixture is a container a STEP starts.** The
+//! `test` job in `yadgarhq/actions/.github/workflows/ci-pr.yaml` ends with a
+//! step named *the ignored suites that need a private-CA engine*: it generates
+//! the CA and the leaf, starts MariaDB on 3307 with them, exports the three
+//! variables below and runs `cargo test --test <target> -- --ignored`. That step
+//! also asserts the summary line reports a non-zero pass count with zero still
+//! ignored, because `cargo test -- --ignored` exits 0 having run NOTHING — which
+//! is how a job that proves this suite ran could stop being one without anybody
+//! noticing.
 //!
-//! **Standing the fixture up**, which is also what CI would need to do in a
-//! step rather than a service:
+//! A `services:` container cannot serve it, for two reasons rather than one.
+//! Service containers start before the first step, so a certificate a step
+//! generates does not exist yet; and `services:` does take `volumes:`, so that
+//! ordering alone would merely argue for committing a certificate here. The part
+//! that rules the shape out is that MariaDB reads `ssl_cert` and `ssl_key` ONCE
+//! AT STARTUP, so a certificate arriving afterwards is never read whatever
+//! produced it.
+//!
+//! **THE `#[ignore]` STAYS, AND ITS REASON CHANGED.** It used to state a
+//! non-execution CI could not fix. Now it is what lets one suite have two
+//! audiences: the job's ordinary `cargo test --all-features` has no private-CA
+//! engine and no variables, so an un-ignored suite would make `require()` panic
+//! on every pull request in this repository. `#[ignore]` is the switch the
+//! fixture-supplying step throws with `--ignored`, and nothing else throws it.
+//! An early `return` would hide the suite instead of listing it, and the helpers
+//! below still panic once it is asked to run, so it cannot pass against nothing.
+//!
+//! **Standing the fixture up locally: run the step, do not retype it.** A recipe
+//! written out here and a step in `ci-pr.yaml` are two copies of one fixture kept
+//! in agreement by hand, and the copy CI runs is the one that is true. Extract it
+//! and run it from this repository's root:
 //!
 //! ```text
-//! D=/tmp/yadgar-store-tls; mkdir -p $D
-//! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-//!   -keyout $D/good-ca.key -out $D/good-ca.pem -subj "/CN=yadgar-store-test-good-ca"
-//! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-//!   -keyout $D/wrong-ca.key -out $D/wrong-ca.pem -subj "/CN=yadgar-store-test-wrong-ca"
-//! openssl req -newkey rsa:2048 -nodes \
-//!   -keyout $D/server.key -out $D/server.csr -subj "/CN=localhost"
-//! printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > $D/server.ext
-//! openssl x509 -req -in $D/server.csr -CA $D/good-ca.pem -CAkey $D/good-ca.key \
-//!   -CAcreateserial -out $D/server.pem -days 3650 -extfile $D/server.ext
-//! chmod 644 $D/*.pem $D/*.key   # the container's mysql uid must READ these
-//!
-//! podman run -d --name yadgar-store-tls-probe -p 127.0.0.1:3307:3306 \
-//!   -e MARIADB_ROOT_PASSWORD=probe -e MARIADB_DATABASE=probe -v $D:/certs:ro \
-//!   mariadb:11.8 --ssl-ca=/certs/good-ca.pem --ssl-cert=/certs/server.pem \
-//!   --ssl-key=/certs/server.key --require-secure-transport=ON
-//!
-//! export YADGAR_TEST_TLS_DSN='mysql://root:probe@localhost:3307/probe'
-//! export YADGAR_TEST_TLS_CA=$D/good-ca.pem
-//! export YADGAR_TEST_TLS_WRONG_CA=$D/wrong-ca.pem
-//! cargo test --test engine_tls -- --ignored
+//! python3 -c 'import yaml,sys
+//! d=yaml.safe_load(open(sys.argv[1]))
+//! print(next(s["run"] for s in d["jobs"]["test"]["steps"]
+//!            if s.get("name","").startswith("the ignored suites")))' \
+//!   ../actions/.github/workflows/ci-pr.yaml > /tmp/private-ca-engine.sh
+//! RUNNER_TEMP=$(mktemp -d) GITHUB_STEP_SUMMARY=/dev/null bash /tmp/private-ca-engine.sh
 //! ```
+//!
+//! It needs `openssl`, `jq` and a Docker-compatible CLI on `PATH`, and it reads
+//! the pinned MariaDB image back from what is already pulled — so pull it first:
+//! `docker pull mariadb@sha256:<the digest that job's services: block names>`.
 //!
 //! `localhost` rather than `127.0.0.1` in the DSN deliberately: `verify_identity`
 //! checks the host against the certificate, and the `DNS:localhost` SAN is the
@@ -91,8 +96,11 @@ const DSN: &str = "YADGAR_TEST_TLS_DSN";
 const CA: &str = "YADGAR_TEST_TLS_CA";
 const WRONG_CA: &str = "YADGAR_TEST_TLS_WRONG_CA";
 
-/// The recipe, repeated where a runner will actually see it. A suite asked to
-/// run against nothing must say what is missing, not report success.
+/// The contract, stated where a runner will actually see it. A suite asked to
+/// run against nothing must say what is missing, not report success — and these
+/// three names ARE the contract: the CI step decides which targets to run by
+/// reading which test sources mention `YADGAR_TEST_TLS_DSN`, so renaming one
+/// here without renaming it there is how this suite would stop running.
 fn require(var: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| {
         panic!(
@@ -100,7 +108,7 @@ fn require(var: &str) -> String {
              This suite asserts that PoolConfig::ssl_ca reaches the TLS handshake; \
              running it without an engine whose certificate a KNOWN CA signed would \
              report success while proving nothing.\n\
-             See this file's header for the openssl and podman recipe. All three of \
+             See this file's header for how to stand the fixture up. All three of \
              {DSN}, {CA} and {WRONG_CA} are required."
         )
     })
