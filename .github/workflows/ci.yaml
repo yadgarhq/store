@@ -35,7 +35,7 @@ jobs:
   # job breaks the merge gate rather than reporting anything.
   ci:
     if: github.event_name == 'pull_request'
-    uses: yadgarhq/actions/.github/workflows/ci-pr.yaml@feat/ledger-714-private-ca-engine
+    uses: yadgarhq/actions/.github/workflows/ci-pr.yaml@main
     permissions:
       contents: read
 
