@@ -215,6 +215,15 @@ async fn a_lock_another_replica_holds_is_a_boot_failure_naming_the_wait() {
         err.to_string().contains("concurrently"),
         "the operator needs to be told this is a refusal, not a crash: {err}"
     );
+    // AND THE WAIT MUST REACH THE MESSAGE, not only the variant. `seconds: 1`
+    // above proves the value is plumbed from the caller's `LockOptions`; it says
+    // nothing about the rendered text, so deleting `{seconds}s` from the
+    // `#[error]` template leaves this test green and the operator reading a
+    // refusal that does not say how long it waited.
+    assert!(
+        err.to_string().contains("1s"),
+        "the message must name the wait it gave up after: {err}"
+    );
 
     // Nothing was applied while the other replica held the lock.
     let ledger_exists: Option<String> = sqlx::query_scalar(
