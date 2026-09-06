@@ -95,6 +95,27 @@ fn the_engines_own_reserved_connections_are_accounted_for() {
         c.check_engine_headroom().is_err(),
         "using every connection must fail: it leaves nothing for an operator"
     );
+
+    // BRACKETED, because asking for the whole engine proves nothing about the
+    // size of the reserve. `151 x 1` is refused whatever the reserve is, down to
+    // and including one connection, so the assertion above went green with the
+    // reserve cut from five to one — and the case it exists to describe, an
+    // operator locked out of an engine the pool has almost filled, was untested.
+    //
+    // The pair below is the boundary itself: 151 - 5 = 146 usable, so 146 is the
+    // largest request that leaves the reserve whole and 147 is the smallest that
+    // eats into it. Moving the reserve in either direction moves this boundary
+    // and one of the two halves fails.
+    c.max_connections = 146;
+    assert!(
+        c.check_engine_headroom().is_ok(),
+        "146 leaves the five reserved connections whole and must be accepted"
+    );
+    c.max_connections = 147;
+    assert!(
+        c.check_engine_headroom().is_err(),
+        "147 takes one of the five reserved connections and must be refused"
+    );
 }
 
 #[test]
