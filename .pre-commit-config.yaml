@@ -72,3 +72,12 @@ repos:
       - id: complexity
       - id: cargo-clippy-complexity
       - id: cargo-deny
+      # D67 handler instrumentation, adopted for CLASS UNIFORMITY. Measured
+      # 2026-09-09 this crate declares no tonic server trait and no
+      # `Router::new()`, so the gate judges zero handlers today and reports a
+      # pass. It arms the day this crate grows a handler.
+      - id: observe-coverage
+      # LEDGER 658. A ceiling on `run:` block size, adopted for the same
+      # uniformity reason: this repository's workflows hold no block scalar,
+      # exactly like the nine other consumers that already carry the id.
+      - id: run-block-size
