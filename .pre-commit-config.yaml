@@ -23,7 +23,7 @@ repos:
   # `pre-commit autoupdate`.
 
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.18.2
+    rev: v1.20.0
     hooks:
       - id: gitleaks
       - id: prettier
@@ -81,3 +81,12 @@ repos:
       # uniformity reason: this repository's workflows hold no block scalar,
       # exactly like the nine other consumers that already carry the id.
       - id: run-block-size
+      # LEDGER 837. Refuses a test that stops running instead of failing — a
+      # skip marker, an unsatisfiable `cfg`, an environment-probe guard as a
+      # test's first statement, a narrowed `cargo test`/pytest invocation, or
+      # a captured run with its exit code suppressed. ADR-0577: a published
+      # hook nobody references gates nothing, so this line is what makes it
+      # gate this repository, not the tag on `yadgarhq/actions`. The rev also
+      # carries v1.19.0's `observe-coverage` tightening, which refuses
+      # nothing here.
+      - id: no-test-skips
