@@ -23,7 +23,7 @@ repos:
   # `pre-commit autoupdate`.
 
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.18.2
+    rev: v1.20.0
     hooks:
       - id: gitleaks
       - id: prettier
@@ -81,3 +81,4 @@ repos:
       # uniformity reason: this repository's workflows hold no block scalar,
       # exactly like the nine other consumers that already carry the id.
       - id: run-block-size
+      - id: no-test-skips
