@@ -1507,6 +1507,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "yadgar-store",
 ]
 
 [[package]]

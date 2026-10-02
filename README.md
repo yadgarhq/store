@@ -87,8 +87,8 @@ how an outage happens.
 `migrate::apply` takes a `LockOptions`, and the only way to build one is
 `LockOptions::new(timeout_secs)`. There is no default (ADR-0569): how long a
 replica waits for another one's migration depends on the installation's tables
-and engine, so each `-db` twin reads the wait from its own configuration and
-refuses to start when it is absent. `new` refuses anything below one second,
+and engine, so from v0.3.0 each `-db` twin is to read the wait from its own
+configuration and refuse to start when it is absent. `new` refuses anything below one second,
 because MariaDB 11.8 answers a negative wait with NULL at once and a zero wait
 does not wait at all. The lock NAME stays a constant: it is an address every
 replica must agree on, not a setting.

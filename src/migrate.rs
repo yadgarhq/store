@@ -216,13 +216,14 @@ impl LockOptions {
         })
     }
 
-    /// The same lock under another name — FOR TESTS ONLY.
+    /// The same lock under another name — FOR TESTS ONLY, behind the
+    /// `test-support` feature so no service can reach it.
     ///
     /// `GET_LOCK` is server-wide rather than per-database, so a suite that
     /// holds the lock on purpose to reach `LockUnavailable` must not collide
     /// with every other test taking [`LOCK`]. A service has no use for this:
     /// replicas that took different names would not serialise at all.
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
