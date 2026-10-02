@@ -82,6 +82,17 @@ the older binary knows 4. Treating that as "nothing pending" runs old code
 against a newer schema **silently**, which is how data is corrupted rather than
 how an outage happens.
 
+### The migration lock's wait is the caller's knob
+
+`migrate::apply` takes a `LockOptions`, and the only way to build one is
+`LockOptions::new(timeout_secs)`. There is no default (ADR-0569): how long a
+replica waits for another one's migration depends on the installation's tables
+and engine, so from v0.3.0 each `-db` twin is to read the wait from its own
+configuration and refuse to start when it is absent. `new` refuses anything below one second,
+because MariaDB 11.8 answers a negative wait with NULL at once and a zero wait
+does not wait at all. The lock NAME stays a constant: it is an address every
+replica must agree on, not a setting.
+
 ## Status
 
 Capability probing, credentials, migrations, pool configuration and the backup

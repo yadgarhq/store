@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{migrations, root, scratch_pool};
+use common::{lock, migrations, root, scratch_pool};
 use yadgar_store::{backup, migrate};
 
 /// D6: a backup nobody has restored is a hypothesis. The counting half is what
@@ -16,7 +16,9 @@ use yadgar_store::{backup, migrate};
 #[tokio::test]
 async fn row_counts_come_from_the_engine_and_verify() {
     let pool = scratch_pool("ys_backup").await;
-    migrate::apply(&pool, &migrations()).await.expect("apply");
+    migrate::apply(&pool, &migrations(), &lock())
+        .await
+        .expect("apply");
 
     sqlx::raw_sql("INSERT INTO thing (id) VALUES (1), (2), (3)")
         .execute(&pool)
@@ -51,7 +53,9 @@ async fn row_counts_come_from_the_engine_and_verify() {
 #[tokio::test]
 async fn a_restore_that_lost_rows_fails_verification() {
     let pool = scratch_pool("ys_lost").await;
-    migrate::apply(&pool, &migrations()).await.expect("apply");
+    migrate::apply(&pool, &migrations(), &lock())
+        .await
+        .expect("apply");
     sqlx::raw_sql("INSERT INTO thing (id) VALUES (1), (2), (3)")
         .execute(&pool)
         .await
@@ -90,7 +94,9 @@ async fn a_restore_that_lost_rows_fails_verification() {
 #[tokio::test]
 async fn census_counts_a_different_schema_than_the_pool_is_connected_to() {
     let pool = scratch_pool("ys_census_here").await;
-    migrate::apply(&pool, &migrations()).await.expect("apply");
+    migrate::apply(&pool, &migrations(), &lock())
+        .await
+        .expect("apply");
     sqlx::raw_sql("INSERT INTO thing (id) VALUES (1), (2), (3)")
         .execute(&pool)
         .await

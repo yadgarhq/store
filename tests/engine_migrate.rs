@@ -6,14 +6,16 @@
 
 mod common;
 
-use common::{migration, migrations, root, scratch_pool};
+use common::{lock, migration, migrations, root, scratch_pool};
 use yadgar_store::migrate::{self, LockOptions, MigrationError, MigrationSet};
 
 #[tokio::test]
 async fn migrations_apply_in_order_and_exactly_once() {
     let pool = scratch_pool("ys_migrate").await;
 
-    let applied = migrate::apply(&pool, &migrations()).await.expect("apply");
+    let applied = migrate::apply(&pool, &migrations(), &lock())
+        .await
+        .expect("apply");
     assert_eq!(applied, 2, "both migrations should apply");
 
     // Column from migration 2 exists, so ordering held.
@@ -22,7 +24,7 @@ async fn migrations_apply_in_order_and_exactly_once() {
         .await
         .expect("migration 2 must have run after migration 1");
 
-    let again = migrate::apply(&pool, &migrations())
+    let again = migrate::apply(&pool, &migrations(), &lock())
         .await
         .expect("re-apply");
     assert_eq!(again, 2, "a second run applies nothing new");
@@ -33,7 +35,9 @@ async fn migrations_apply_in_order_and_exactly_once() {
 #[tokio::test]
 async fn a_database_ahead_of_the_binary_refuses_to_boot() {
     let pool = scratch_pool("ys_ahead").await;
-    migrate::apply(&pool, &migrations()).await.expect("apply");
+    migrate::apply(&pool, &migrations(), &lock())
+        .await
+        .expect("apply");
 
     let older = MigrationSet::new(vec![migration(
         1,
@@ -42,7 +46,7 @@ async fn a_database_ahead_of_the_binary_refuses_to_boot() {
     )])
     .expect("valid");
 
-    let err = migrate::apply(&pool, &older)
+    let err = migrate::apply(&pool, &older, &lock())
         .await
         .expect_err("an older binary must refuse a newer schema");
     assert!(
@@ -73,7 +77,8 @@ async fn concurrent_replicas_do_not_race_on_migrations() {
         .expect("pool b");
 
     let (ma, mb) = (migrations(), migrations());
-    let (ra, rb) = tokio::join!(migrate::apply(&a, &ma), migrate::apply(&b, &mb));
+    let (la, lb) = (lock(), lock());
+    let (ra, rb) = tokio::join!(migrate::apply(&a, &ma, &la), migrate::apply(&b, &mb, &lb));
 
     // BOTH must succeed. One migrates, the other waits and finds the ledger
     // already current — neither may fail, because a failing replica crash-loops.
@@ -136,7 +141,7 @@ async fn ledger_high_water(pool: &sqlx::MySqlPool) -> u64 {
 async fn a_failed_migration_leaves_the_ledger_exactly_where_it_stopped() {
     let pool = scratch_pool("ys_partial").await;
 
-    let err = migrate::apply(&pool, &broken_set())
+    let err = migrate::apply(&pool, &broken_set(), &lock())
         .await
         .expect_err("migration 2 is not valid SQL");
     assert!(
@@ -157,7 +162,7 @@ async fn a_failed_migration_leaves_the_ledger_exactly_where_it_stopped() {
 
     // The recovery: fix migration 2 and boot again. 1 is not reapplied, 2 and 3
     // are, and the run reports 3.
-    let applied = migrate::apply(&pool, &fixed_set())
+    let applied = migrate::apply(&pool, &fixed_set(), &lock())
         .await
         .expect("the fixed set must apply from where the broken one stopped");
     assert_eq!(applied, 3);
@@ -188,22 +193,21 @@ async fn a_failed_migration_leaves_the_ledger_exactly_where_it_stopped() {
 #[tokio::test]
 async fn a_lock_another_replica_holds_is_a_boot_failure_naming_the_wait() {
     let pool = scratch_pool("ys_lock_busy").await;
-    let lock = LockOptions {
-        name: "yadgar_migrate_test_busy".into(),
-        timeout_secs: 1,
-    };
+    let lock = LockOptions::new(1)
+        .expect("one second")
+        .with_name("yadgar_migrate_test_busy");
 
     // A stand-in for the replica that is already migrating.
     let mut holder = root().await;
     let held: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, ?)")
-        .bind(&lock.name)
+        .bind(lock.name())
         .bind(0)
         .fetch_one(&mut holder)
         .await
         .expect("take the lock");
     assert_eq!(held, Some(1), "the test must actually hold the lock");
 
-    let err = migrate::apply_with(&pool, &migrations(), &lock)
+    let err = migrate::apply(&pool, &migrations(), &lock)
         .await
         .expect_err("migrating while another replica holds the lock must fail");
 
@@ -248,12 +252,11 @@ async fn a_lock_another_replica_holds_is_a_boot_failure_naming_the_wait() {
 #[tokio::test]
 async fn the_lock_is_released_after_a_migration_fails() {
     let pool = scratch_pool("ys_lock_release").await;
-    let lock = LockOptions {
-        name: "yadgar_migrate_test_release".into(),
-        timeout_secs: 1,
-    };
+    let lock = LockOptions::new(1)
+        .expect("one second")
+        .with_name("yadgar_migrate_test_release");
 
-    migrate::apply_with(&pool, &broken_set(), &lock)
+    migrate::apply(&pool, &broken_set(), &lock)
         .await
         .expect_err("migration 2 is not valid SQL");
 
@@ -261,7 +264,7 @@ async fn the_lock_is_released_after_a_migration_fails() {
     // and asking on the connection that held it would prove nothing.
     let mut observer = root().await;
     let free: Option<i64> = sqlx::query_scalar("SELECT IS_FREE_LOCK(?)")
-        .bind(&lock.name)
+        .bind(lock.name())
         .fetch_one(&mut observer)
         .await
         .expect("is_free_lock");
@@ -273,7 +276,7 @@ async fn the_lock_is_released_after_a_migration_fails() {
     );
 
     // And the proof that it is really free: another apply can take it.
-    migrate::apply_with(&pool, &fixed_set(), &lock)
+    migrate::apply(&pool, &fixed_set(), &lock)
         .await
         .expect("a retry must be able to take the lock again");
 }

@@ -24,7 +24,16 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["rt", "time"] }
 
+[features]
+# Test-only surface: `LockOptions::with_name`, so an engine suite that holds the
+# migration lock on purpose does not collide with every other test taking the
+# one server-wide name. No service enables this; replicas that took different
+# names would not serialise at all.
+test-support = []
+
 [dev-dependencies]
+# Turns `test-support` on for this crate's own integration tests only.
+yadgar-store = { path = ".", features = ["test-support"] }
 tempfile = "3"
 # The probe suite talks to a real engine (D69). The library itself stays
 # runtime-agnostic — only the tests need one.

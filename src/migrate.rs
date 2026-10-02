@@ -126,6 +126,13 @@ pub enum MigrationError {
          Refusing to migrate concurrently — that is what corrupts a schema."
     )]
     LockUnavailable { seconds: i32 },
+
+    #[error(
+        "the migration lock wait must be at least 1 second, and {seconds} was \
+         configured. A negative wait never takes the lock and zero never waits \
+         for the other replica, so either fails the boot for the wrong reason."
+    )]
+    LockTimeoutInvalid { seconds: i32 },
 }
 
 impl MigrationError {
@@ -150,42 +157,86 @@ const LEDGER: &str = "yadgar_schema_migrations";
 /// MariaDB's GET_LOCK is held by a CONNECTION and released when it drops, which
 /// is the property that matters here: a replica killed mid-migration cannot
 /// leave the lock held forever.
-const LOCK: &str = "yadgar_migrate";
-
-/// How long a replica waits for another one's migration before giving up.
 ///
-/// Long enough for a real migration on a real table, short enough that a
-/// deadlock surfaces as a boot failure rather than a pod hanging in Running.
-const LOCK_TIMEOUT_SECS: i32 = 60;
+/// **THIS IS AN ADDRESS, NOT A KNOB**, in the sense `yadgar-lifecycle`'s
+/// `CONFIG_DIR` is one. ADR-0569 governs the VALUE of a setting. A lock name is
+/// an identifier every replica of a module must agree on, or they do not
+/// serialise against each other; letting an installation vary it would buy
+/// nothing and could only break that. `tests/migrate.rs` pins the spelling.
+const LOCK: &str = "yadgar_migrate";
 
 /// Which lock to take, and how long to wait for it.
 ///
-/// The two values above are the defaults every service uses, and
-/// [`apply`] is still the whole API for them. This struct exists so the
-/// FAILURE branches can be tested at all: `LockUnavailable` is reachable only
-/// when another connection already holds the lock, which means a test must wait
-/// out the timeout — 60 seconds — and must not collide with the one lock name
-/// every other test in the suite is also taking, since `GET_LOCK` is
-/// server-wide rather than per-database.
+/// **THE WAIT HAS NO DEFAULT HERE (ADR-0569).** Up to v0.2.13 this struct
+/// implemented `Default` with a compiled-in 60 seconds, and `apply` used it, so
+/// every `-db` twin ran a 60-second wait that no configuration file stated and
+/// no operator could change. How long a migration takes is a property of the
+/// installation — its table sizes, its engine, a managed service's IOPS — so the
+/// wait is a knob, and a knob is read from the owning service's configuration
+/// and handed in. The caller is the one that knows which knob and which file to
+/// name when it is absent; this crate refuses only a value that cannot mean
+/// "wait for the other replica", via [`LockOptions::new`].
 ///
-/// Untestable-by-construction is how the branch that refuses concurrent
-/// migration ended up with zero coverage while being the thing standing between
-/// two replicas and a corrupted schema.
+/// The fields are private so that refusal cannot be stepped around with a
+/// struct literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockOptions {
-    /// Server-wide `GET_LOCK` name. Every replica of a module must use the
-    /// same one, or they do not serialise against each other.
-    pub name: String,
-    /// Seconds to wait before giving up and failing the boot.
-    pub timeout_secs: i32,
+    /// Server-wide `GET_LOCK` name. [`LOCK`] outside tests.
+    name: String,
+    /// Seconds to wait before giving up and failing the boot. Always >= 1.
+    timeout_secs: i32,
 }
 
-impl Default for LockOptions {
-    fn default() -> Self {
-        Self {
-            name: LOCK.to_string(),
-            timeout_secs: LOCK_TIMEOUT_SECS,
+impl LockOptions {
+    /// The migration lock, waiting `timeout_secs` for another replica's
+    /// migration before failing the boot.
+    ///
+    /// # Errors
+    ///
+    /// [`MigrationError::LockTimeoutInvalid`] for anything below one second.
+    /// Both refusals are MEASURED on MariaDB 11.8.9 rather than reasoned:
+    ///
+    /// - a NEGATIVE wait makes `GET_LOCK` return NULL at once with warning 1411
+    ///   "Incorrect timeout value", even when nobody holds the lock. Passed
+    ///   through, the migration never runs and the boot fails as
+    ///   [`MigrationError::LockUnavailable`], telling the operator another
+    ///   replica is migrating when none is;
+    /// - ZERO makes `GET_LOCK` try once and not wait. D55 starts two replicas at
+    ///   once, so the second fails its boot on every rollout that carries a
+    ///   migration.
+    pub fn new(timeout_secs: i32) -> Result<Self, MigrationError> {
+        if timeout_secs < 1 {
+            return Err(MigrationError::LockTimeoutInvalid {
+                seconds: timeout_secs,
+            });
         }
+        Ok(Self {
+            name: LOCK.to_string(),
+            timeout_secs,
+        })
+    }
+
+    /// The same lock under another name — FOR TESTS ONLY, behind the
+    /// `test-support` feature so no service can reach it.
+    ///
+    /// `GET_LOCK` is server-wide rather than per-database, so a suite that
+    /// holds the lock on purpose to reach `LockUnavailable` must not collide
+    /// with every other test taking [`LOCK`]. A service has no use for this:
+    /// replicas that took different names would not serialise at all.
+    #[cfg(feature = "test-support")]
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// The `GET_LOCK` name this takes.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Seconds a replica waits for another one's migration.
+    pub fn timeout_secs(&self) -> i32 {
+        self.timeout_secs
     }
 }
 
@@ -197,16 +248,10 @@ impl Default for LockOptions {
 /// believing a half-applied set will roll back when it will not. Per-migration
 /// is the honest unit — a failure leaves earlier migrations applied and recorded,
 /// which is recoverable because the ledger says exactly where it stopped.
-pub async fn apply(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, MigrationError> {
-    apply_with(pool, set, &LockOptions::default()).await
-}
-
-/// [`apply`], with the lock's name and timeout supplied rather than defaulted.
 ///
-/// Services call [`apply`]. This exists so the lock's failure branches are
-/// reachable from a test without a sixty-second wait and without every test in
-/// the suite contending on one server-wide name.
-pub async fn apply_with(
+/// `lock` carries the wait the caller read from its own configuration; there is
+/// no form of this function that supplies one for it (ADR-0569).
+pub async fn apply(
     pool: &MySqlPool,
     set: &MigrationSet,
     lock: &LockOptions,
