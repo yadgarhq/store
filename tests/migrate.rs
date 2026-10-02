@@ -4,7 +4,7 @@
 //! migrations — it can only apply what a module hands it, in order, exactly
 //! once. That constraint is what these tests are about.
 
-use yadgar_store::migrate::{Migration, MigrationError, MigrationSet};
+use yadgar_store::migrate::{LockOptions, Migration, MigrationError, MigrationSet};
 
 fn m(version: u64, name: &str, sql: &str) -> Migration {
     Migration {
@@ -106,4 +106,55 @@ fn a_database_level_with_the_binary_is_fine() {
     let set = MigrationSet::new(vec![m(1, "a", "SELECT 1"), m(2, "b", "SELECT 2")]).unwrap();
     assert!(set.check_not_ahead(2).is_ok());
     assert!(set.check_not_ahead(0).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// The migration lock's wait. A KNOB WITH NO DEFAULT HERE (ADR-0569): the caller
+// reads it from its own configuration and hands it in, and this crate refuses a
+// value that cannot mean "wait for the other replica".
+// ---------------------------------------------------------------------------
+
+/// MEASURED on MariaDB 11.8.9: `GET_LOCK(name, -1)` returns NULL at once with
+/// warning 1411 "Incorrect timeout value", EVEN WHEN NOBODY HOLDS THE LOCK. Passed
+/// through, the migration never runs and the boot fails as `LockUnavailable` —
+/// telling the operator another replica is migrating when none is.
+#[test]
+fn a_negative_lock_wait_is_refused_before_it_reaches_the_engine() {
+    let err = LockOptions::new(-1).expect_err("a negative wait never takes the lock");
+    assert!(
+        matches!(err, MigrationError::LockTimeoutInvalid { seconds: -1 }),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("-1"),
+        "the refusal must name the value it was given: {err}"
+    );
+}
+
+/// `GET_LOCK(name, 0)` tries once and does not wait (measured, 11.8.9). D55 starts
+/// two replicas at once, so the second would fail its boot on EVERY rollout that
+/// carries a migration — a crash loop by configuration, not a choice.
+#[test]
+fn a_zero_lock_wait_is_refused_because_the_second_replica_could_never_wait() {
+    let err = LockOptions::new(0).expect_err("zero is not a wait");
+    assert!(
+        matches!(err, MigrationError::LockTimeoutInvalid { seconds: 0 }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_positive_lock_wait_is_carried_through_unchanged() {
+    let lock = LockOptions::new(90).expect("90 seconds is a wait");
+    assert_eq!(lock.timeout_secs(), 90);
+}
+
+/// THE LOCK NAME IS AN ADDRESS, NOT A KNOB, so it is a constant and its spelling
+/// is pinned here. Every replica of a module must use the same one or they do not
+/// serialise; a name that varied per installation would buy nothing and could
+/// only break that.
+#[test]
+fn the_lock_name_every_service_takes_is_pinned() {
+    let lock = LockOptions::new(60).expect("60 seconds is a wait");
+    assert_eq!(lock.name(), "yadgar_migrate");
 }

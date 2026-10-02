@@ -105,3 +105,10 @@ pub fn migrations() -> MigrationSet {
     ])
     .expect("valid set")
 }
+
+/// The migration lock as a service builds it, with the wait a service's own
+/// configuration would supply. Stated here, in a TEST, because `store` has no
+/// default for it any more (ADR-0569).
+pub fn lock() -> yadgar_store::migrate::LockOptions {
+    yadgar_store::migrate::LockOptions::new(60).expect("60 seconds is a wait")
+}
