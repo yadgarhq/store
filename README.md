@@ -62,7 +62,21 @@ D4 calls the `-db` twin a **connection concentrator**: N replicas of a logic
 service with embedded pools multiply connections against an engine with hard
 limits. So `max_connections x replicas` is checked against the engine's limit at
 boot, minus a reserve so an operator can still connect when the pools have taken
-everything.
+everything. The reserve is `PoolConfig::operator_reserve`, which each `-db`
+reads from its own chart value (ADR-0849); this crate keeps no number for it.
+MariaDB's own reserve is not a substitute: measured on 11.8.9, it admits exactly
+one `CONNECTION ADMIN` session above `max_connections` and nothing for a client
+without that privilege.
+
+`pool::pool_options` states every pool behaviour rather than inheriting sqlx's:
+`acquire_timeout`, `idle_timeout` and `max_lifetime` come from `PoolConfig`
+(ADR-0569), and `test_before_acquire(true)` and `min_connections(0)` are written
+out with their argument.
+
+Zero is refused for all four settings: `acquire_timeout`, `idle_timeout`,
+`max_lifetime` and `operator_reserve`. The refusal is `PoolError::InvalidPoolSetting`.
+It comes from `check_engine_headroom`, before any connection, and it names the
+field and the chart key that sets it (for example `database.acquireTimeoutSeconds`).
 
 The failure this prevents does not look like a configuration error. It looks like
 intermittent "too many connections" under load, on whichever service connects

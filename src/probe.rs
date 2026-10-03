@@ -133,12 +133,12 @@ mod tests {
     use sqlx::Connection;
 
     async fn connect() -> sqlx::MySqlConnection {
-        let dsn = std::env::var("YADGAR_TEST_DSN").unwrap_or_else(|_| {
+        let Ok(dsn) = std::env::var("YADGAR_TEST_DSN") else {
             panic!(
                 "YADGAR_TEST_DSN is unset, so there is no engine to probe. See \
                  tests/probe.rs for the podman one-liner."
             )
-        });
+        };
         sqlx::MySqlConnection::connect(&dsn)
             .await
             .expect("could not reach the engine named by YADGAR_TEST_DSN")

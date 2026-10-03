@@ -21,6 +21,38 @@ async fn the_pool_connects_with_a_resolved_credential() {
     assert_eq!(one, 1);
 }
 
+/// **`connect` BUILDS ITS POOL FROM `pool_options`, not from a second, drifting
+/// copy of it.** `tests/pool.rs` asserts what `pool_options` returns; this
+/// asserts that the pool `connect` hands back carries the same values, read
+/// from the live pool. None of the three is sqlx's own default (30s, 600s,
+/// 1800s), so a `connect` that bypassed `pool_options` fails here.
+#[tokio::test]
+async fn connect_builds_the_pool_from_the_configured_options() {
+    let mut cfg = scratch("ys_pool_options").await;
+    let (_, secret) = config_and_secret("ys_pool_options");
+    cfg.acquire_timeout = std::time::Duration::from_secs(11);
+    cfg.idle_timeout = std::time::Duration::from_secs(123);
+    cfg.max_lifetime = std::time::Duration::from_secs(456);
+
+    let pool = yadgar_store::pool::connect(&cfg, &secret)
+        .await
+        .expect("pool");
+    let options = pool.options();
+
+    assert_eq!(
+        options.get_acquire_timeout(),
+        std::time::Duration::from_secs(11)
+    );
+    assert_eq!(
+        options.get_idle_timeout(),
+        Some(std::time::Duration::from_secs(123))
+    );
+    assert_eq!(
+        options.get_max_lifetime(),
+        Some(std::time::Duration::from_secs(456))
+    );
+}
+
 /// The headroom check is a boot refusal, so it must run inside `connect` rather
 /// than being something a caller is trusted to remember (D4).
 #[tokio::test]
