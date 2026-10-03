@@ -10,7 +10,7 @@ use yadgar_store::capability::{Capability, CapabilitySet, Determination};
 use yadgar_store::probe;
 
 fn require_dsn() -> String {
-    std::env::var("YADGAR_TEST_DSN").unwrap_or_else(|_| {
+    let Ok(value) = std::env::var("YADGAR_TEST_DSN") else {
         panic!(
             "YADGAR_TEST_DSN is unset, so there is no engine to probe.\n\
              These tests assert what a real MariaDB does; running them without \
@@ -20,7 +20,8 @@ fn require_dsn() -> String {
              -e MARIADB_DATABASE=probe -p 3306:3306 mariadb:11.8\n  \
              export YADGAR_TEST_DSN='mysql://root:probe@127.0.0.1:3306/probe'"
         )
-    })
+    };
+    value
 }
 
 async fn connect() -> sqlx::MySqlConnection {

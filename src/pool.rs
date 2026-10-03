@@ -12,6 +12,7 @@
 //! service happens to connect last, and scaling up makes it worse.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::MySqlPool;
@@ -22,13 +23,6 @@ use crate::credentials::Secret;
 /// already owns connections, instead of reaching into sqlx for a type this crate
 /// is responsible for choosing.
 pub use sqlx::mysql::MySqlSslMode;
-
-/// Connections an engine keeps back for `SUPER`, so an operator can still get in
-/// when the pools have taken everything.
-///
-/// A headroom check that ignores this passes right up to the moment nobody can
-/// log in to diagnose why nothing else can.
-const OPERATOR_RESERVE: u32 = 5;
 
 /// The smallest pool that can migrate itself.
 ///
@@ -43,17 +37,8 @@ const OPERATOR_RESERVE: u32 = 5;
 /// and not the cause. Only 0 was rejected, so 1 passed the headroom check and
 /// failed half a minute later, one layer away from the reason. Refusing at boot
 /// with a message that says *migration lock* is the whole fix.
+// ADR-0569-EXCEPTION(CC): a correctness floor derived from `migrate::apply`'s two-connection shape, not a tunable; no deployment can choose 1 and work.
 const MIN_CONNECTIONS: u32 = 2;
-
-/// The mode a `-db` uses when its deployment says nothing: encrypt, and refuse
-/// to fall back.
-///
-/// A STRING rather than a [`MySqlSslMode`], so the binary's environment default,
-/// the chart's value and this crate all name one token. It is deliberately NOT
-/// `preferred`: that is sqlx's own default, and sqlx documents it as falling
-/// back to an unencrypted connection when an encrypted one cannot be
-/// established.
-pub const DEFAULT_SSL_MODE: &str = "required";
 
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
@@ -70,6 +55,37 @@ pub struct PoolConfig {
     /// The engine's own limit, so the arithmetic can be checked rather than
     /// assumed.
     pub engine_max_connections: u32,
+
+    /// Connections of `engine_max_connections` this pool arithmetic leaves
+    /// untouched, so an operator, a backup job or a monitoring agent can still
+    /// connect when every replica's pool is full.
+    ///
+    /// **A REQUIRED VALUE, NOT A CONSTANT (ADR-0849).** It was `5`, compiled in,
+    /// and the right number depends on the engine an adopter runs and on what
+    /// else connects to it — which is a deployment fact, so each `-db` reads it
+    /// from its own chart value.
+    ///
+    /// **WHAT THE ENGINE ALREADY KEEPS IS NOT THIS.** Measured against MariaDB
+    /// 11.8.9 (`max_connections=10`, `extra_port=0`, the image default): ten
+    /// non-admin sessions fill it and the eleventh is refused with 1040; ONE
+    /// session holding `CONNECTION ADMIN` (`SUPER`) still gets in, as the
+    /// eleventh; a second admin session is refused. So MariaDB's own reserve is
+    /// one admin connection ABOVE `max_connections`, and nothing for a client
+    /// without that privilege. This field is headroom INSIDE
+    /// `max_connections`, on top of that single slot — and 0 would leave a
+    /// non-admin operator nothing at all.
+    pub operator_reserve: u32,
+
+    /// How long `acquire` waits for a free connection before failing. Replaces
+    /// sqlx's 30s, which equalled the caller's whole request deadline and so
+    /// could never surface as this pool's error first.
+    pub acquire_timeout: Duration,
+    /// How long an idle connection is kept before the pool closes it. Replaces
+    /// sqlx's 600s.
+    pub idle_timeout: Duration,
+    /// The age at which a connection is retired however busy it is. Replaces
+    /// sqlx's 1800s.
+    pub max_lifetime: Duration,
 
     /// How TLS is negotiated to the engine, and how far the engine's identity is
     /// checked. D58 puts every `-db` on TLS, and the RUSTSEC-2023-0071 exception
@@ -225,13 +241,15 @@ impl PoolConfig {
         }
 
         let requested = self.max_connections.saturating_mul(self.replicas.max(1));
-        let usable = self.engine_max_connections.saturating_sub(OPERATOR_RESERVE);
+        let usable = self
+            .engine_max_connections
+            .saturating_sub(self.operator_reserve);
 
         if requested > usable {
             return Err(PoolError::WouldExhaustEngine {
                 requested,
                 available: self.engine_max_connections,
-                reserved: OPERATOR_RESERVE,
+                reserved: self.operator_reserve,
             });
         }
         Ok(())
@@ -310,8 +328,8 @@ impl PoolConfig {
 /// `sqlx-mysql`'s `encrypt_rsa` — the RUSTSEC-2023-0071 path — opens with
 /// `if stream.is_tls { return Ok(to_asciz(password)) }`, so over TLS the RSA
 /// exchange never happens. That holds for a connection that IS TLS, and fails
-/// for one that fell back, which is the whole reason `DEFAULT_SSL_MODE` is
-/// `required` rather than `preferred`.
+/// for one that fell back, which is the whole reason a deployment states
+/// `required` (or `verify_identity`) rather than `preferred`.
 ///
 /// So the probe takes these options too, and neither caller decides anything
 /// about transport on its own.
@@ -354,13 +372,35 @@ pub fn connect_options(
     })
 }
 
+/// The pool's own behaviour, every value stated rather than inherited.
+///
+/// **NOTHING HERE FALLS THROUGH TO A SQLX DEFAULT (ADR-0569).** sqlx-core 0.9.0's
+/// `PoolOptions::new` (`pool/options.rs:149-162`) picks `acquire_timeout` 30s,
+/// `idle_timeout` 600s, `max_lifetime` 1800s, `min_connections` 0 and
+/// `test_before_acquire` true. The three durations are deployment facts and come
+/// from [`PoolConfig`]; the two that remain are correctness choices this crate
+/// makes, written down below so a sqlx upgrade that changes its defaults changes
+/// nothing here.
+///
+/// Separate from [`connect`] so the options can be asserted without an engine.
+pub fn pool_options(config: &PoolConfig) -> MySqlPoolOptions {
+    MySqlPoolOptions::new()
+        .max_connections(config.max_connections)
+        .acquire_timeout(config.acquire_timeout)
+        .idle_timeout(config.idle_timeout)
+        .max_lifetime(config.max_lifetime)
+        // ADR-0569-EXCEPTION(CC): a pinged connection is the only kind handed out; an engine restart or a killed session otherwise reaches the caller as its query's error.
+        .test_before_acquire(true)
+        // ADR-0569-EXCEPTION(CC): no floor of connections held open when idle; idle ones close after `idle_timeout`, and the headroom check bounds the pool by `max_connections` either way.
+        .min_connections(0)
+}
+
 pub async fn connect(config: &PoolConfig, secret: &Secret) -> Result<MySqlPool, PoolError> {
     config.check_engine_headroom()?;
 
     let options = connect_options(config, secret)?;
 
-    MySqlPoolOptions::new()
-        .max_connections(config.max_connections)
+    pool_options(config)
         .connect_with(options)
         .await
         .map_err(|source| PoolError::Connect {

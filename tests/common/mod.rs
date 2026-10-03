@@ -18,13 +18,14 @@ use yadgar_store::migrate::{Migration, MigrationSet};
 use yadgar_store::pool::{MySqlSslMode, PoolConfig};
 
 pub fn dsn() -> String {
-    std::env::var("YADGAR_TEST_DSN").unwrap_or_else(|_| {
+    let Ok(value) = std::env::var("YADGAR_TEST_DSN") else {
         panic!(
             "YADGAR_TEST_DSN is unset. These tests assert what a real MariaDB \
              does; running them without one reports success while proving \
              nothing. See tests/probe.rs for the podman one-liner."
         )
-    })
+    };
+    value
 }
 
 /// Parse the test DSN into a config plus its secret, so the pool constructor is
@@ -46,6 +47,10 @@ pub fn config_and_secret(db: &str) -> (PoolConfig, Secret) {
             max_connections: 4,
             replicas: 2,
             engine_max_connections: 151,
+            operator_reserve: 5,
+            acquire_timeout: std::time::Duration::from_secs(25),
+            idle_timeout: std::time::Duration::from_secs(600),
+            max_lifetime: std::time::Duration::from_secs(1800),
             // The CI service container speaks plaintext on loopback; D58's TLS
             // requirement is asserted by tests/pool.rs, which checks the default
             // mode and the options the connection is actually built with.

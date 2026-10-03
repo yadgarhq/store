@@ -102,7 +102,7 @@ const WRONG_CA: &str = "YADGAR_TEST_TLS_WRONG_CA";
 /// reading which test sources mention `YADGAR_TEST_TLS_DSN`, so renaming one
 /// here without renaming it there is how this suite would stop running.
 fn require(var: &str) -> String {
-    std::env::var(var).unwrap_or_else(|_| {
+    let Ok(value) = std::env::var(var) else {
         panic!(
             "{var} is unset, so there is no private-CA engine to verify against.\n\
              This suite asserts that PoolConfig::ssl_ca reaches the TLS handshake; \
@@ -111,7 +111,8 @@ fn require(var: &str) -> String {
              See this file's header for how to stand the fixture up. All three of \
              {DSN}, {CA} and {WRONG_CA} are required."
         )
-    })
+    };
+    value
 }
 
 /// A config pointed at the TLS fixture, under the only mode a CA can change.
@@ -140,6 +141,10 @@ fn tls_config(ca: Option<String>) -> (PoolConfig, Secret) {
             max_connections: 2,
             replicas: 1,
             engine_max_connections: 151,
+            operator_reserve: 5,
+            acquire_timeout: std::time::Duration::from_secs(25),
+            idle_timeout: std::time::Duration::from_secs(600),
+            max_lifetime: std::time::Duration::from_secs(1800),
             ssl_mode: MySqlSslMode::VerifyIdentity,
             ssl_ca: ca.map(Into::into),
         },

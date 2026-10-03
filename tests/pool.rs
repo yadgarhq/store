@@ -7,9 +7,11 @@
 //! tuning knob, and these tests are about the arithmetic nobody does until an
 //! engine starts refusing connections.
 
+use std::time::Duration;
+
 use yadgar_store::credentials::Secret;
 use yadgar_store::pool::{
-    connect_options, parse_ssl_mode, MySqlSslMode, PoolConfig, PoolError, DEFAULT_SSL_MODE,
+    connect_options, parse_ssl_mode, pool_options, MySqlSslMode, PoolConfig, PoolError,
 };
 
 fn cfg() -> PoolConfig {
@@ -21,6 +23,12 @@ fn cfg() -> PoolConfig {
         max_connections: 10,
         replicas: 2,
         engine_max_connections: 151,
+        operator_reserve: 5,
+        // None of the three is sqlx's own default (30s, 600s, 1800s), so a
+        // `pool_options` that ignored the config would be caught below.
+        acquire_timeout: Duration::from_secs(7),
+        idle_timeout: Duration::from_secs(120),
+        max_lifetime: Duration::from_secs(900),
         ssl_mode: MySqlSslMode::Required,
         ssl_ca: None,
     }
@@ -102,7 +110,8 @@ fn the_engines_own_reserved_connections_are_accounted_for() {
     // reserve cut from five to one — and the case it exists to describe, an
     // operator locked out of an engine the pool has almost filled, was untested.
     //
-    // The pair below is the boundary itself: 151 - 5 = 146 usable, so 146 is the
+    // The pair below is the boundary itself: with `cfg()`'s reserve of five,
+    // 151 - 5 = 146 usable, so 146 is the
     // largest request that leaves the reserve whole and 147 is the smallest that
     // eats into it. Moving the reserve in either direction moves this boundary
     // and one of the two halves fails.
@@ -128,20 +137,16 @@ fn zero_connections_is_rejected() {
     ));
 }
 
+/// D58 puts every -db on TLS to its engine, and the RUSTSEC-2023-0071 exception
+/// recorded in deny.toml depends on that being true. The mode is the
+/// deployment's to state — this crate keeps no default token for it any more
+/// (ADR-0569) — so what is asserted is that the configured mode is the one the
+/// DSN names, and that the token a chart writes parses to it.
 #[test]
-fn tls_is_required_by_default_and_the_dsn_says_so() {
-    // D58 puts every -db on TLS to its engine, and the RUSTSEC-2023-0071
-    // exception recorded in deny.toml depends on that being true.
-    //
-    // `DEFAULT_SSL_MODE` is the token the binary and the chart both name, so it
-    // is asserted against the two modes that would betray the decision rather
-    // than against whatever it happens to say today. `preferred` is the trap:
-    // sqlx documents it as falling back to an unencrypted connection, and it is
-    // sqlx's own default for anything that does not set a mode.
+fn the_dsn_names_the_configured_tls_mode() {
     assert_eq!(
-        mode_name(parse_ssl_mode(DEFAULT_SSL_MODE).expect("the default must parse")),
-        "Required",
-        "the default must encrypt and refuse to fall back"
+        mode_name(parse_ssl_mode("required").expect("required is a mode")),
+        "Required"
     );
     assert!(
         cfg().dsn().contains("ssl-mode=REQUIRED"),
@@ -499,4 +504,71 @@ fn two_connections_is_the_floor_and_is_accepted() {
     let mut c = cfg();
     c.max_connections = 2;
     assert!(c.check_engine_headroom().is_ok());
+}
+
+/// **THE RESERVE IS THE CONFIGURED ONE (ADR-0849), and the boundary moves with
+/// it.** `engine_max = 10`, `max = 4` per replica, `2` replicas: 8 requested.
+/// A reserve of 2 leaves 8 usable, exactly enough; a reserve of 3 leaves 7, one
+/// short. A check still reading a compiled-in five refuses both, and one that
+/// ignores the reserve accepts both.
+#[test]
+fn the_configured_operator_reserve_decides_the_headroom() {
+    let mut c = cfg();
+    c.engine_max_connections = 10;
+    c.max_connections = 4;
+    c.replicas = 2;
+
+    c.operator_reserve = 2;
+    assert!(
+        c.check_engine_headroom().is_ok(),
+        "reserve 2: usable 8 >= requested 8 must be accepted"
+    );
+
+    c.operator_reserve = 3;
+    let err = c
+        .check_engine_headroom()
+        .expect_err("reserve 3: usable 7 < requested 8 must be refused");
+    assert!(
+        matches!(
+            err,
+            PoolError::WouldExhaustEngine {
+                requested: 8,
+                available: 10,
+                reserved: 3,
+            }
+        ),
+        "the refusal must report the configured reserve: {err}"
+    );
+}
+
+/// **EVERY POOL BEHAVIOUR IS STATED, NONE INHERITED (ADR-0569).** sqlx-core
+/// 0.9.0 defaults `acquire_timeout` to 30s, `idle_timeout` to 600s and
+/// `max_lifetime` to 1800s; `cfg()` uses none of those, so each assertion fails
+/// against a `pool_options` that forgets to pass its field through. No engine is
+/// needed: these are sqlx's own getters on the options `connect` uses.
+#[test]
+fn pool_options_carry_the_configured_durations() {
+    let options = pool_options(&cfg());
+
+    assert_eq!(options.get_acquire_timeout(), Duration::from_secs(7));
+    assert_eq!(options.get_idle_timeout(), Some(Duration::from_secs(120)));
+    assert_eq!(options.get_max_lifetime(), Some(Duration::from_secs(900)));
+    assert_eq!(options.get_max_connections(), 10);
+}
+
+/// The two pool behaviours this crate chooses rather than a deployment, pinned
+/// so a sqlx upgrade that moves its defaults moves nothing here.
+#[test]
+fn pool_options_state_the_crates_own_choices() {
+    let options = pool_options(&cfg());
+
+    assert!(
+        options.get_test_before_acquire(),
+        "a connection is pinged before it is handed out"
+    );
+    assert_eq!(
+        options.get_min_connections(),
+        0,
+        "no idle floor: the headroom arithmetic counts max_connections only"
+    );
 }
