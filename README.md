@@ -73,6 +73,11 @@ without that privilege.
 (ADR-0569), and `test_before_acquire(true)` and `min_connections(0)` are written
 out with their argument.
 
+Zero is refused for all four settings: `acquire_timeout`, `idle_timeout`,
+`max_lifetime` and `operator_reserve`. The refusal is `PoolError::InvalidPoolSetting`.
+It comes from `check_engine_headroom`, before any connection, and it names the
+field and the chart key that sets it (for example `database.acquireTimeoutSeconds`).
+
 The failure this prevents does not look like a configuration error. It looks like
 intermittent "too many connections" under load, on whichever service connects
 last, and scaling up makes it worse.

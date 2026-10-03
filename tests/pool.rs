@@ -93,9 +93,10 @@ fn a_replica_count_that_would_exhaust_the_engine_is_rejected_at_boot() {
 
 #[test]
 fn the_engines_own_reserved_connections_are_accounted_for() {
-    // MariaDB reserves connections for SUPER so an operator can still get in
-    // when the pool has taken everything. A check that ignores that passes
-    // right up to the moment nobody can log in to diagnose it.
+    // The check keeps `operator_reserve` connections free inside
+    // max_connections; MariaDB itself keeps only one CONNECTION ADMIN slot
+    // above it (measured 11.8.9), so a check that ignores the reserve locks out
+    // every non-admin operator.
     let mut c = cfg();
     c.max_connections = 151;
     c.replicas = 1;
@@ -548,12 +549,16 @@ fn the_configured_operator_reserve_decides_the_headroom() {
 /// needed: these are sqlx's own getters on the options `connect` uses.
 #[test]
 fn pool_options_carry_the_configured_durations() {
-    let options = pool_options(&cfg());
+    let mut c = cfg();
+    // Not `cfg()`'s 10: that is sqlx's own default `max_connections`, so an
+    // assertion on 10 passes against a `pool_options` that never set it.
+    c.max_connections = 4;
+    let options = pool_options(&c);
 
     assert_eq!(options.get_acquire_timeout(), Duration::from_secs(7));
     assert_eq!(options.get_idle_timeout(), Some(Duration::from_secs(120)));
     assert_eq!(options.get_max_lifetime(), Some(Duration::from_secs(900)));
-    assert_eq!(options.get_max_connections(), 10);
+    assert_eq!(options.get_max_connections(), 4);
 }
 
 /// The two pool behaviours this crate chooses rather than a deployment, pinned
@@ -571,4 +576,61 @@ fn pool_options_state_the_crates_own_choices() {
         0,
         "no idle floor: the headroom arithmetic counts max_connections only"
     );
+}
+
+/// **ZERO IS NOT A SETTING, IT IS A MISSING ONE (operator ruling 2026-10-03).**
+/// A zero acquire timeout fails every acquire that has to wait; a zero idle
+/// timeout or lifetime closes connections as fast as it opens them; a zero
+/// reserve leaves a non-admin operator nothing. Each is refused before any
+/// connection, and the refusal names the field AND the chart key that sets it,
+/// since the chart is where an operator fixes it.
+#[test]
+fn a_zero_pool_setting_is_refused_naming_field_and_chart_key() {
+    type Zero = fn(&mut PoolConfig);
+    let cases: [(&str, &str, Zero); 4] = [
+        ("acquire_timeout", "database.acquireTimeoutSeconds", |c| {
+            c.acquire_timeout = Duration::ZERO
+        }),
+        ("idle_timeout", "database.idleTimeoutSeconds", |c| {
+            c.idle_timeout = Duration::ZERO
+        }),
+        ("max_lifetime", "database.maxLifetimeSeconds", |c| {
+            c.max_lifetime = Duration::ZERO
+        }),
+        ("operator_reserve", "database.engineOperatorReserve", |c| {
+            c.operator_reserve = 0
+        }),
+    ];
+    for (field, chart_key, zero) in cases {
+        let mut c = cfg();
+        zero(&mut c);
+        let err = c
+            .check_engine_headroom()
+            .expect_err("a zero pool setting must be refused at boot");
+        assert!(
+            matches!(err, PoolError::InvalidPoolSetting { field: f, .. } if f == field),
+            "{field}: wrong refusal: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(field),
+            "{field}: message must name the field: {msg}"
+        );
+        assert!(
+            msg.contains(chart_key),
+            "{field}: message must name the chart key {chart_key}: {msg}"
+        );
+    }
+}
+
+/// One is the smallest legal value of each, so the refusal is ZERO and not a
+/// floor somewhere above it.
+#[test]
+fn the_smallest_nonzero_pool_settings_are_accepted() {
+    let mut c = cfg();
+    c.acquire_timeout = Duration::from_secs(1);
+    c.idle_timeout = Duration::from_secs(1);
+    c.max_lifetime = Duration::from_secs(1);
+    c.operator_reserve = 1;
+    assert!(c.check_engine_headroom().is_ok());
 }

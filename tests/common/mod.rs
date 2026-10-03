@@ -52,8 +52,8 @@ pub fn config_and_secret(db: &str) -> (PoolConfig, Secret) {
             idle_timeout: std::time::Duration::from_secs(600),
             max_lifetime: std::time::Duration::from_secs(1800),
             // The CI service container speaks plaintext on loopback; D58's TLS
-            // requirement is asserted by tests/pool.rs, which checks the default
-            // mode and the options the connection is actually built with.
+            // requirement is asserted by tests/pool.rs, which checks that the
+            // configured mode reaches the DSN and the connect options.
             // Turning it on here would test the container's certificate setup,
             // not this crate.
             ssl_mode: MySqlSslMode::Disabled,

@@ -19,6 +19,9 @@ use sqlx::MySqlPool;
 
 use crate::credentials::Secret;
 
+mod error;
+pub use error::PoolError;
+
 /// Re-exported so a `-db` binary names the transport mode through the seam that
 /// already owns connections, instead of reaching into sqlx for a type this crate
 /// is responsible for choosing.
@@ -37,8 +40,7 @@ pub use sqlx::mysql::MySqlSslMode;
 /// and not the cause. Only 0 was rejected, so 1 passed the headroom check and
 /// failed half a minute later, one layer away from the reason. Refusing at boot
 /// with a message that says *migration lock* is the whole fix.
-// ADR-0569-EXCEPTION(CC): a correctness floor derived from `migrate::apply`'s two-connection shape, not a tunable; no deployment can choose 1 and work.
-const MIN_CONNECTIONS: u32 = 2;
+const MIN_CONNECTIONS: u32 = 2; // ADR-0569-EXCEPTION(CC): migration-lock floor from `migrate::apply`'s two-connection shape, not a tunable.
 
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
@@ -79,6 +81,10 @@ pub struct PoolConfig {
     /// How long `acquire` waits for a free connection before failing. Replaces
     /// sqlx's 30s, which equalled the caller's whole request deadline and so
     /// could never surface as this pool's error first.
+    ///
+    /// Must be below the caller's deadline (dial `REQUEST_TIMEOUT`, 30s). Each
+    /// `-db` chart bounds it (schema max 29, shipped 25) and pins it against
+    /// dial in `tests/chart_request_deadline.rs` (C-DB2).
     pub acquire_timeout: Duration,
     /// How long an idle connection is kept before the pool closes it. Replaces
     /// sqlx's 600s.
@@ -231,8 +237,54 @@ impl PoolConfig {
         Ok(())
     }
 
-    /// Refuse a configuration whose replicas would exhaust the engine.
+    /// Refuse a zero pool setting (operator ruling 2026-10-03).
+    ///
+    /// Zero is never a working value for any of these: an acquire timeout of
+    /// zero fails every acquire that has to wait, an idle timeout or lifetime
+    /// of zero closes connections as fast as the pool opens them, and a reserve
+    /// of zero leaves a non-admin operator no way in. Each `-db` chart's schema
+    /// already demands an integer of at least one; this is the same rule held
+    /// where the values are used, so a caller that skips the chart cannot
+    /// reach the engine with one.
+    fn check_pool_settings(&self) -> Result<(), PoolError> {
+        for (field, chart_key, zero) in [
+            (
+                "acquire_timeout",
+                "database.acquireTimeoutSeconds",
+                self.acquire_timeout.is_zero(),
+            ),
+            (
+                "idle_timeout",
+                "database.idleTimeoutSeconds",
+                self.idle_timeout.is_zero(),
+            ),
+            (
+                "max_lifetime",
+                "database.maxLifetimeSeconds",
+                self.max_lifetime.is_zero(),
+            ),
+            (
+                "operator_reserve",
+                "database.engineOperatorReserve",
+                self.operator_reserve == 0,
+            ),
+        ] {
+            if zero {
+                return Err(PoolError::InvalidPoolSetting {
+                    field,
+                    chart_key,
+                    value: "0".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a configuration whose replicas would exhaust the engine, or whose
+    /// pool settings are zero.
     pub fn check_engine_headroom(&self) -> Result<(), PoolError> {
+        self.check_pool_settings()?;
+
         if self.max_connections < MIN_CONNECTIONS {
             return Err(PoolError::InvalidSize {
                 max_connections: self.max_connections,
@@ -389,10 +441,8 @@ pub fn pool_options(config: &PoolConfig) -> MySqlPoolOptions {
         .acquire_timeout(config.acquire_timeout)
         .idle_timeout(config.idle_timeout)
         .max_lifetime(config.max_lifetime)
-        // ADR-0569-EXCEPTION(CC): a pinged connection is the only kind handed out; an engine restart or a killed session otherwise reaches the caller as its query's error.
-        .test_before_acquire(true)
-        // ADR-0569-EXCEPTION(CC): no floor of connections held open when idle; idle ones close after `idle_timeout`, and the headroom check bounds the pool by `max_connections` either way.
-        .min_connections(0)
+        .test_before_acquire(true) // ADR-0569-EXCEPTION(CC): ping before handing out, so a dead connection never reaches a query.
+        .min_connections(0) // ADR-0569-EXCEPTION(CC): no idle floor; the headroom check bounds the pool by max_connections.
 }
 
 pub async fn connect(config: &PoolConfig, secret: &Secret) -> Result<MySqlPool, PoolError> {
@@ -408,71 +458,4 @@ pub async fn connect(config: &PoolConfig, secret: &Secret) -> Result<MySqlPool, 
             dsn: config.dsn(),
             source,
         })
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PoolError {
-    #[error("could not connect to {dsn}: {source}")]
-    Connect {
-        dsn: String,
-        #[source]
-        source: sqlx::Error,
-    },
-
-    #[error(
-        "pool would exhaust the engine: {requested} connections requested \
-         (max_connections x replicas) against an engine allowing {available}, \
-         of which {reserved} stay reserved so an operator can still connect. \
-         Refusing at boot — the alternative surfaces as intermittent \
-         'too many connections' under load, on whichever service connects last."
-    )]
-    WouldExhaustEngine {
-        requested: u32,
-        available: u32,
-        reserved: u32,
-    },
-
-    #[error(
-        "max_connections is {max_connections}; a pool needs at least {minimum}. \
-         Zero cannot connect at all, and one deadlocks on its own migration: \
-         `migrate::apply` holds the migration lock on one connection while the \
-         migrations run on a second. Refusing at boot, because the alternative \
-         is a 30-second hang ending in 'pool timed out while waiting for an open \
-         connection' — which names the pool rather than the cause."
-    )]
-    InvalidSize { max_connections: u32, minimum: u32 },
-
-    #[error(
-        "{value:?} is not an ssl-mode. Accepted: disabled, preferred, required, \
-         verify_ca, verify_identity. Refusing at boot rather than guessing — the \
-         expression this replaces read a boolean and treated every spelling but \
-         `true` as DISABLED, so a deployment that asked for TLS got an \
-         unencrypted connection and no log line either way. Of the five: \
-         `preferred` falls back to cleartext when the engine will not negotiate \
-         TLS; `required` encrypts but checks no certificate; `verify_ca` names a \
-         check it does not perform and is refused when a connection is built, \
-         see SslModeCannotVerify; `verify_identity` checks the certificate \
-         chain AND the hostname, and is the only mode that binds the connection \
-         to the engine it names. A verifying mode checks against the CA named by \
-         `ssl_ca` IN ADDITION TO the public web roots, never instead of them — \
-         and those roots sign no operator-issued, RDS or Aurora engine \
-         certificate."
-    )]
-    UnknownSslMode { value: String },
-
-    #[error(
-        "ssl-mode {mode} cannot verify the engine's identity, so it is refused at \
-         boot rather than offered. Use verify_identity, which checks the same \
-         certificate chain AND the hostname; it needs no other change. Measured in \
-         sqlx 0.9: the trust store is seeded from the public web roots before the \
-         configured ssl_ca is appended, so naming an authority widens it and never \
-         restricts it, and every mode except verify_identity skips the hostname \
-         check. Together those accept ANY publicly-trusted certificate for ANY \
-         name as the engine — a stranger holding a certificate for their own \
-         domain passes. A CA file does not close that, which is why this refuses \
-         the mode instead of demanding one. If the engine's certificate does not \
-         carry the name being dialled, the fix is that certificate; `required` \
-         states the same real guarantee without naming a check nobody performs."
-    )]
-    SslModeCannotVerify { mode: &'static str },
 }
