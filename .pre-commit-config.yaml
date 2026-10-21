@@ -23,7 +23,7 @@ repos:
   # `pre-commit autoupdate`.
 
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.30.4
+    rev: v1.36.1
     hooks:
       - id: gitleaks
       - id: prettier
@@ -77,6 +77,14 @@ repos:
       # `Router::new()`, so the gate judges zero handlers today and reports a
       # pass. It arms the day this crate grows a handler.
       - id: observe-coverage
+      # LEDGER 1242, ADR-0569. Refuses a compiled-in configuration default — a
+      # `fn env_or`, an env helper taking a `default`, or an inline
+      # `env::var(..).unwrap_or*`. Unmarked hits at adoption were four test
+      # helpers reading `YADGAR_TEST_DSN`-style variables through
+      # `unwrap_or_else(|_| panic!(..))`: a refusal, not a default, rewritten as
+      # `let Ok(..) = .. else { panic!(..) }` so the gate needs no exception.
+      # `git grep ADR-0569-EXCEPTION` lists the deliberate constants.
+      - id: no-compiled-in-defaults
       # LEDGER 658. A ceiling on `run:` block size, adopted for the same
       # uniformity reason: this repository's workflows hold no block scalar,
       # exactly like the nine other consumers that already carry the id.
@@ -90,11 +98,3 @@ repos:
       # carries v1.19.0's `observe-coverage` tightening, which refuses
       # nothing here.
       - id: no-test-skips
-      # LEDGER 1242, ADR-0569. Refuses a compiled-in configuration default — a
-      # `fn env_or`, an env helper taking a `default`, or an inline
-      # `env::var(..).unwrap_or*`. Unmarked hits at adoption were four test
-      # helpers reading `YADGAR_TEST_DSN`-style variables through
-      # `unwrap_or_else(|_| panic!(..))`: a refusal, not a default, rewritten as
-      # `let Ok(..) = .. else { panic!(..) }` so the gate needs no exception.
-      # `git grep ADR-0569-EXCEPTION` lists the deliberate constants.
-      - id: no-compiled-in-defaults
