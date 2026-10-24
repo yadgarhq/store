@@ -123,9 +123,8 @@ pub enum MigrationError {
     #[error(
         "could not take the migration lock {name} within {seconds}s. Another \
          process on this database server holds it: a replica of this module \
-         that is still migrating, another module or install sharing the server \
-         (the legacy name yadgar_migrate is server-wide), or one that died \
-         holding a connection. Refusing to migrate concurrently — that is what \
+         that is still migrating, another install migrating the same database, \
+         or one that died holding a connection. Refusing to migrate concurrently — that is what \
          corrupts a schema. The wait is the chart key \
          database.migrationLockTimeoutSeconds."
     )]
@@ -163,8 +162,8 @@ use sqlx::{AssertSqlSafe, MySqlPool};
 /// updated — so the history is readable, not just the high-water mark.
 const LEDGER: &str = "yadgar_schema_migrations";
 
-/// The LEGACY lock name, server-wide, so concurrent replicas serialise on
-/// migration.
+/// The PREFIX of the per-database lock name ([`LockOptions::per_database_name`]),
+/// so concurrent replicas of one database serialise on migration.
 ///
 /// MariaDB's GET_LOCK is held by a SESSION and released when the session ends,
 /// which is the property that matters here: a replica killed mid-migration
@@ -185,16 +184,15 @@ const LEDGER: &str = "yadgar_schema_migrations";
 /// ([`LockOptions::per_database_name`]), rolled out in two releases because a
 /// rollout runs old and new pods at once:
 ///
-/// - **Release A (this one)** takes this legacy name FIRST and then the
-///   per-database name, on the same connection. Old pods take only the legacy
-///   name, so they still serialise against new pods.
-/// - **Release B** takes only the per-database name. Release A pods hold that
-///   name too, so A and B still serialise. B must not ship to a module until
-///   every pod of it runs A: skipping A reopens D55's double-CREATE race for
-///   the length of the rollout.
-///
-/// No deadlock: every holder of both takes them in the same order, and a
-/// release B pod never asks for the legacy name.
+/// - **Release A (v0.5.x)** took this name alone, server-wide (the legacy
+///   lock), FIRST and then the per-database name, on the same connection.
+///   Pods older than A take only the legacy name, so they serialised against
+///   A pods.
+/// - **Release B (this one)** takes only the per-database name. Release A pods
+///   hold that name too, so A and B still serialise. B must not reach a module
+///   until every pod of it runs A: a pod older than A and a B pod share no
+///   name, which reopens D55's double-CREATE race for the rollout. For the
+///   same reason a module running B rolls back only to A, never to v0.4.x.
 const LOCK: &str = "yadgar_migrate";
 
 /// MySQL's `GET_LOCK` name limit, in characters. MariaDB 11.8.9 measured 192;
@@ -268,14 +266,15 @@ impl LockOptions {
         self
     }
 
-    /// The legacy, server-wide `GET_LOCK` name this takes first.
+    /// The prefix of the per-database `GET_LOCK` name. Release B no longer
+    /// takes this name by itself.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// The per-database `GET_LOCK` name for `database`: the legacy name, a
-    /// colon, and the database name. When that would pass 64 characters it is
-    /// the legacy name, a colon, and the first 16 hex digits of SHA-256 of the
+    /// The per-database `GET_LOCK` name for `database`: the prefix, a colon,
+    /// and the database name. When that would pass 64 characters it is the
+    /// prefix, a colon, and the first 16 hex digits of SHA-256 of the
     /// database name instead. A database name may itself be 64 characters.
     ///
     /// Under `with_name` the override replaces the prefix too, so a test that
@@ -345,38 +344,20 @@ pub async fn apply(
         .map_err(MigrationError::engine)?;
     let per_database = lock.per_database_name(&database.ok_or(MigrationError::NoDatabase)?);
 
-    // RELEASE A: the legacy name first, then the per-database one, always in
-    // that order (see `LOCK`). The two waits share ONE budget: the second gets
-    // only what the first left (review S4), so the worst case is the configured
-    // timeout and not twice it — against a chart maximum of 590 s. In practice
-    // the second is free at once, because any other release A pod that holds
-    // it also holds the legacy name.
-    let started = std::time::Instant::now();
+    // RELEASE B: the per-database name only (see `LOCK`).
     take_lock(
         &mut lock_conn,
-        &lock.name,
+        &per_database,
         lock.timeout_secs,
         lock.timeout_secs,
     )
     .await?;
-    let spent = i32::try_from(started.elapsed().as_secs()).unwrap_or(i32::MAX);
-    let remaining = lock.timeout_secs.saturating_sub(spent).max(0);
-    if let Err(refused) =
-        take_lock(&mut lock_conn, &per_database, remaining, lock.timeout_secs).await
-    {
-        // Released at once rather than left to the close on drop, which ends
-        // the session only after the connection is torn down.
-        release_lock(&mut lock_conn, &lock.name).await;
-        return Err(refused);
-    }
 
     let outcome = apply_locked(pool, set).await;
 
     // Released explicitly rather than left to the close on drop, so the next
     // replica proceeds immediately.
-    // Reverse order of taking.
     release_lock(&mut lock_conn, &per_database).await;
-    release_lock(&mut lock_conn, &lock.name).await;
 
     outcome
 }
