@@ -131,13 +131,16 @@ replica". The new name is `yadgar_migrate:<database>` (the database from
 SHA-256 of the database name). The change ships in two releases, because a
 rollout runs old and new pods together (ADR-1006):
 
-- **Release A** (this one) takes `yadgar_migrate` first, then the per-database
-  name, on one connection. Pods on older releases still serialise against it.
-  The two waits share the one configured timeout: the second gets only what
-  the first left.
-- **Release B** takes only the per-database name. **Every pod of a module must
-  run release A before release B reaches it**; skipping A lets an old pod and a
-  B pod migrate the same database at once.
+- **Release A** (v0.5.x) took `yadgar_migrate` first, then the per-database
+  name, on one connection. Pods on older releases still serialised against it.
+- **Release B** (this one) takes only the per-database name. **Every pod of a
+  module must run release A before release B reaches it**; skipping A lets an
+  old pod and a B pod migrate the same database at once.
+
+**Upgrading from v0.4.x or earlier: pass through v0.5.x.** Deploy a v0.5.x
+release to every pod of every module first, and only then this one. **Rolling
+back from this release goes to v0.5.x only, never to v0.4.x**, for the same
+reason: a v0.4.x pod and a pod on this release share no lock name.
 
 A pool with no default database is refused with `MigrationError::NoDatabase`.
 
