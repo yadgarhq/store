@@ -212,7 +212,7 @@ async fn a_lock_another_replica_holds_is_a_boot_failure_naming_the_wait() {
         .expect_err("migrating while another replica holds the lock must fail");
 
     assert!(
-        matches!(err, MigrationError::LockUnavailable { seconds: 1 }),
+        matches!(err, MigrationError::LockUnavailable { seconds: 1, .. }),
         "the wait it gave up after is part of the message: {err:?}"
     );
     assert!(
@@ -274,9 +274,242 @@ async fn the_lock_is_released_after_a_migration_fails() {
         "the migration lock is still held after a failed migration; the next \
          replica would wait the whole timeout and blame the lock"
     );
+    assert_free(&mut observer, &lock.per_database_name("ys_lock_release")).await;
 
     // And the proof that it is really free: another apply can take it.
     migrate::apply(&pool, &fixed_set(), &lock)
         .await
         .expect("a retry must be able to take the lock again");
+}
+
+/// Whether `name` is free, asked from a connection that never held it.
+async fn assert_free(observer: &mut sqlx::MySqlConnection, name: &str) {
+    let free: Option<i64> = sqlx::query_scalar("SELECT IS_FREE_LOCK(?)")
+        .bind(name)
+        .fetch_one(observer)
+        .await
+        .expect("is_free_lock");
+    assert_eq!(free, Some(1), "lock {name} is still held");
+}
+
+/// Hold `name` on a fresh root connection, returned so the hold lasts.
+async fn hold(name: &str) -> sqlx::MySqlConnection {
+    let mut holder = root().await;
+    let held: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 0)")
+        .bind(name)
+        .fetch_one(&mut holder)
+        .await
+        .expect("take the lock");
+    assert_eq!(held, Some(1), "the test must actually hold {name}");
+    holder
+}
+
+/// RELEASE A's MIXED-VERSION GUARANTEE (yaadgaar #368). During a rollout from
+/// the old store, old pods take only `yadgar_migrate`. A new pod must still
+/// serialise against them, so it must still take the legacy name. Mutant
+/// "take only the per-database lock" goes green here and reopens D55's race.
+#[tokio::test]
+async fn a_holder_of_the_legacy_lock_still_blocks_apply() {
+    let pool = scratch_pool("ys_lock_legacy").await;
+    let lock = LockOptions::new(1)
+        .expect("one second")
+        .with_name("yadgar_migrate_test_legacy");
+
+    let _old_pod = hold(lock.name()).await;
+
+    let err = migrate::apply(&pool, &migrations(), &lock)
+        .await
+        .expect_err("an old pod holding the legacy lock must block a new pod");
+    assert!(
+        matches!(&err, MigrationError::LockUnavailable { name, seconds: 1 } if name == lock.name()),
+        "the refusal must name the legacy lock: {err:?}"
+    );
+
+    // The per-database lock was never taken, so nothing is left behind.
+    let mut observer = root().await;
+    assert_free(&mut observer, &lock.per_database_name("ys_lock_legacy")).await;
+}
+
+/// The new name is taken too, so release B's pods (per-database only) still
+/// serialise against release A's. And the legacy lock taken FIRST must be
+/// released at once when the per-database one is refused, not only when the
+/// lock connection's session ends after its close on drop.
+#[tokio::test]
+async fn the_per_database_lock_blocks_apply_and_frees_the_legacy_lock() {
+    let pool = scratch_pool("ys_lock_perdb").await;
+    let lock = LockOptions::new(1)
+        .expect("one second")
+        .with_name("yadgar_migrate_test_perdb");
+    let per_db = lock.per_database_name("ys_lock_perdb");
+
+    let _new_pod = hold(&per_db).await;
+
+    let err = migrate::apply(&pool, &migrations(), &lock)
+        .await
+        .expect_err("a holder of the per-database lock must block apply");
+    assert!(
+        matches!(&err, MigrationError::LockUnavailable { name, seconds: 1 } if *name == per_db),
+        "the refusal must name the per-database lock: {err:?}"
+    );
+
+    let mut observer = root().await;
+    assert_free(&mut observer, lock.name()).await;
+}
+
+/// The happy path releases both names, so the next replica takes them at
+/// once instead of waiting on pool recycling.
+#[tokio::test]
+async fn a_successful_apply_frees_both_locks() {
+    let pool = scratch_pool("ys_lock_both").await;
+    let lock = LockOptions::new(5)
+        .expect("five seconds")
+        .with_name("yadgar_migrate_test_both");
+
+    migrate::apply(&pool, &migrations(), &lock)
+        .await
+        .expect("apply");
+
+    let mut observer = root().await;
+    assert_free(&mut observer, lock.name()).await;
+    assert_free(&mut observer, &lock.per_database_name("ys_lock_both")).await;
+}
+
+/// A pool with no default database has nothing to name a per-database lock
+/// after, and no migration could run on it either. Refused by name.
+#[tokio::test]
+async fn a_pool_without_a_database_is_refused_before_any_lock() {
+    let url = common::dsn();
+    let server = url
+        .rsplit_once('/')
+        .map(|(head, _)| head)
+        .expect("dsn has a path");
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(server)
+        .await
+        .expect("pool without a database");
+    let lock = LockOptions::new(1)
+        .expect("one second")
+        .with_name("yadgar_migrate_test_nodb");
+
+    let err = migrate::apply(&pool, &migrations(), &lock)
+        .await
+        .expect_err("no database, no migration");
+    assert!(
+        matches!(err, MigrationError::NoDatabase),
+        "the refusal must say there is no database: {err:?}"
+    );
+
+    let mut observer = root().await;
+    assert_free(&mut observer, lock.name()).await;
+}
+
+/// Whether `name` is free, polled for up to `within` from a fresh connection.
+/// A closed session's locks are released by the server shortly after the
+/// close, not at the instant the client drops it.
+async fn freed_within(name: &str, within: std::time::Duration) -> bool {
+    let mut observer = root().await;
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let free: Option<i64> = sqlx::query_scalar("SELECT IS_FREE_LOCK(?)")
+            .bind(name)
+            .fetch_one(&mut observer)
+            .await
+            .expect("is_free_lock");
+        if free == Some(1) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A CANCELLED apply must not hand its lock connection back to the pool
+/// holding a migration lock (review S1/S3 on store#37).
+///
+/// `GET_LOCK` is held by a SESSION. Dropping the `apply` future (a caller's
+/// `timeout`, a shutdown `select!`) used to return that session to the pool
+/// still holding the legacy name, and still waiting server-side on the
+/// per-database one: measured on MariaDB 11.8.9, both were held 7 s later.
+/// The lock connection is now closed on drop, so the server ends the session
+/// and releases both names.
+#[tokio::test]
+async fn a_cancelled_apply_frees_both_lock_names() {
+    let pool = scratch_pool("ys_lock_cancel").await;
+    let lock = LockOptions::new(2)
+        .expect("two seconds")
+        .with_name("yadgar_migrate_test_cancel");
+    let per_db = lock.per_database_name("ys_lock_cancel");
+
+    // apply takes the legacy name, then waits on the per-database one.
+    let holder = hold(&per_db).await;
+
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        migrate::apply(&pool, &migrations(), &lock),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "apply must still be waiting when cancelled"
+    );
+
+    // The abandoned server-side wait on the per-database name ends after the
+    // 2 s lock timeout; the session must then be gone, legacy name with it.
+    assert!(
+        freed_within(lock.name(), std::time::Duration::from_secs(5)).await,
+        "the legacy name is still held by a pooled connection after cancellation"
+    );
+    drop(holder);
+    assert!(
+        freed_within(&per_db, std::time::Duration::from_secs(5)).await,
+        "the per-database name is still held after cancellation"
+    );
+    // And the pool kept serving.
+    drop(pool);
+}
+
+/// The two waits share ONE budget (review S4): the per-database `GET_LOCK`
+/// gets only what the legacy wait left, so the worst case is the configured
+/// timeout, not twice it — which matters against a 590 s chart maximum.
+#[tokio::test]
+async fn the_second_lock_wait_gets_only_the_remaining_budget() {
+    let pool = scratch_pool("ys_lock_budget").await;
+    let lock = LockOptions::new(4)
+        .expect("four seconds")
+        .with_name("yadgar_migrate_test_budget");
+    let per_db = lock.per_database_name("ys_lock_budget");
+
+    // The per-database name stays held; the legacy one is released after 1 s.
+    let _per_db_holder = hold(&per_db).await;
+    let mut legacy_holder = hold(lock.name()).await;
+    let legacy = lock.name().to_string();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _: Option<i64> = sqlx::query_scalar("SELECT RELEASE_LOCK(?)")
+            .bind(&legacy)
+            .fetch_one(&mut legacy_holder)
+            .await
+            .expect("release");
+        legacy_holder
+    });
+
+    let started = std::time::Instant::now();
+    let err = migrate::apply(&pool, &migrations(), &lock)
+        .await
+        .expect_err("the per-database name is held throughout");
+    let elapsed = started.elapsed();
+    let _ = release.await;
+
+    assert!(
+        matches!(&err, MigrationError::LockUnavailable { name, .. } if *name == per_db),
+        "{err:?}"
+    );
+    // 1 s on the legacy name + the 3 s left. Twice the budget would be 1 + 4.
+    assert!(
+        elapsed < std::time::Duration::from_millis(4600),
+        "both waits together took {elapsed:?}, more than the 4 s budget"
+    );
 }

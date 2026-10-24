@@ -27,6 +27,35 @@ pub enum PoolError {
     },
 
     #[error(
+        "pool would exceed the database user's connection cap: {requested} \
+         connections requested (max_connections x replicas) but the account \
+         {username} may hold at most {cap} at once — its MAX_USER_CONNECTIONS, \
+         read from the engine as @@max_user_connections. Lower the chart key \
+         database.maxConnections (DB_MAX_CONNECTIONS) or the replica ceiling \
+         (autoscaling.maxReplicas when autoscaling.enabled is true, or \
+         replicaCount; REPLICAS), or raise the account's limit — under \
+         mariadb-operator, the User resource's spec.maxUserConnections. \
+         Refusing at boot: the alternative is MariaDB error 1226 once enough \
+         replicas fill their pools, on whichever replica connects last."
+    )]
+    WouldExceedUserCap {
+        requested: u32,
+        cap: i64,
+        username: String,
+    },
+
+    #[error(
+        "connected to {dsn} but could not read the account's connection cap \
+         (SELECT @@max_user_connections): {source}. Refusing at boot rather \
+         than skipping the check: the pool may not fit the account."
+    )]
+    UserCapUnreadable {
+        dsn: String,
+        #[source]
+        source: sqlx::Error,
+    },
+
+    #[error(
         "{field} is {value}, and zero is not a pool setting. Set the chart key \
          {chart_key} to an integer of at least 1. Refusing at boot: a zero \
          acquire timeout fails every acquire that waits, a zero idle timeout or \
