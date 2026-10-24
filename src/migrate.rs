@@ -121,11 +121,12 @@ pub enum MigrationError {
     Engine(#[source] sqlx::Error),
 
     #[error(
-        "could not take the migration lock {name} within {seconds}s. Another \
-         process on this database server holds it: a replica of this module \
-         that is still migrating, another install migrating the same database, \
-         or one that died holding a connection. Refusing to migrate concurrently — that is what \
-         corrupts a schema. The wait is the chart key \
+        "could not take the per-database migration lock {name} within \
+         {seconds}s: another process on this database server holds it. It may \
+         be a pod of this module that is still migrating, another install \
+         migrating the same database, or a process that died holding its \
+         connection. Refusing to migrate concurrently — that is what corrupts \
+         a schema. The wait is the chart key \
          database.migrationLockTimeoutSeconds."
     )]
     LockUnavailable { name: String, seconds: i32 },
@@ -212,21 +213,21 @@ const LOCK_NAME_HASH_HEX: usize = 16; // ADR-0569-EXCEPTION(CC): part of the loc
 /// wait is a knob, and a knob is read from the owning service's configuration
 /// and handed in. The caller is the one that knows which knob and which file to
 /// name when it is absent; this crate refuses only a value that cannot mean
-/// "wait for the other replica", via [`LockOptions::new`].
+/// "wait for the process that holds the lock", via [`LockOptions::new`].
 ///
 /// The fields are private so that refusal cannot be stepped around with a
 /// struct literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockOptions {
-    /// Server-wide `GET_LOCK` name. [`LOCK`] outside tests.
+    /// Prefix of the per-database `GET_LOCK` name. [`LOCK`] outside tests.
     name: String,
     /// Seconds to wait before giving up and failing the boot. Always >= 1.
     timeout_secs: i32,
 }
 
 impl LockOptions {
-    /// The migration lock, waiting `timeout_secs` for another replica's
-    /// migration before failing the boot.
+    /// The migration lock, waiting `timeout_secs` for whichever process on
+    /// this database server holds it before failing the boot.
     ///
     /// # Errors
     ///
@@ -237,7 +238,7 @@ impl LockOptions {
     ///   "Incorrect timeout value", even when nobody holds the lock. Passed
     ///   through, the migration never runs and the boot fails as
     ///   [`MigrationError::LockUnavailable`], telling the operator another
-    ///   replica is migrating when none is;
+    ///   process holds the lock when none does;
     /// - ZERO makes `GET_LOCK` try once and not wait. D55 starts two replicas at
     ///   once, so the second fails its boot on every rollout that carries a
     ///   migration.
@@ -290,7 +291,7 @@ impl LockOptions {
         format!("{}:{}", self.name, &hex[..LOCK_NAME_HASH_HEX])
     }
 
-    /// Seconds a replica waits for another one's migration.
+    /// Seconds to wait for the process that holds the lock.
     pub fn timeout_secs(&self) -> i32 {
         self.timeout_secs
     }
