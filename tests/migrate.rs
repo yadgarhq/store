@@ -163,13 +163,13 @@ fn the_lock_name_every_service_takes_is_pinned() {
 // The per-database lock name (yaadgaar #368, ADR-1006), release A.
 //
 // `GET_LOCK` names are server-wide, so one `yadgar_migrate` serialised every
-// module whose database shares a server. Release A takes the legacy name AND
-// `yadgar_migrate:<database>`; release B drops the legacy one. These pin the
-// spelling of both, because replicas that disagree on a name do not serialise.
+// module whose database shares a server. Release A took the legacy name AND
+// `yadgar_migrate:<database>`; release B takes only the second. These pin its
+// spelling, because replicas that disagree on a name do not serialise.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_per_database_lock_name_is_the_legacy_name_and_the_database() {
+fn the_per_database_lock_name_is_the_prefix_and_the_database() {
     let lock = LockOptions::new(60).expect("60 seconds is a wait");
     assert_eq!(lock.per_database_name("task"), "yadgar_migrate:task");
 }
@@ -211,10 +211,10 @@ fn the_length_limit_counts_characters_not_bytes() {
     assert_eq!(lock.per_database_name(&db), format!("yadgar_migrate:{db}"));
 }
 
-/// The test-support override must move BOTH names, or a suite that holds a
-/// lock on purpose collides with every other test on the shared legacy name.
+/// The test-support override moves the prefix, so a suite that holds a lock
+/// on purpose collides with no other test.
 #[test]
-fn with_name_overrides_the_legacy_and_the_per_database_name() {
+fn with_name_overrides_the_prefix_of_the_per_database_name() {
     let lock = LockOptions::new(60)
         .expect("60 seconds is a wait")
         .with_name("yadgar_migrate_test");
