@@ -134,3 +134,85 @@ async fn a_failed_connection_never_carries_the_credential_into_its_error() {
         "credential leaked into Debug: {debug}"
     );
 }
+
+/// A throwaway account capped at `cap`, granted on `db`, and a config that
+/// connects as it. Accounts are server-wide, so each test names its own.
+async fn capped_user(db: &str, user: &str, cap: u32) -> (yadgar_store::pool::PoolConfig, Secret) {
+    let mut cfg = scratch(db).await;
+    let mut root = common::root().await;
+    for stmt in [
+        format!("DROP USER IF EXISTS '{user}'@'%'"),
+        format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'capped' WITH MAX_USER_CONNECTIONS {cap}"),
+        format!("GRANT ALL ON {db}.* TO '{user}'@'%'"),
+    ] {
+        // AUDIT: `db`, `user` and `cap` are literals in the calling test.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
+            .execute(&mut root)
+            .await
+            .expect("account ddl");
+    }
+    cfg.username = user.to_string();
+    (cfg, Secret::new("capped".into()))
+}
+
+/// THE LIVE DEFECT, against a real engine (yaadgaar #200): the operator writes
+/// `MAX_USER_CONNECTIONS 20` and the chart shipped 8 per replica at a KEDA
+/// ceiling of 6. The engine check passes (48 < 151 - 5); the account check
+/// must refuse inside `connect`, reading the cap from the engine itself.
+#[tokio::test]
+async fn connect_refuses_a_pool_the_users_connection_cap_cannot_hold() {
+    let (mut cfg, secret) = capped_user("ys_user_cap", "ys_cap_refused", 20).await;
+    cfg.max_connections = 8;
+    cfg.replicas = 6;
+
+    let err = yadgar_store::pool::connect(&cfg, &secret)
+        .await
+        .expect_err("48 connections cannot fit an account capped at 20");
+    assert!(
+        matches!(
+            err,
+            yadgar_store::pool::PoolError::WouldExceedUserCap {
+                requested: 48,
+                cap: 20,
+                ..
+            }
+        ),
+        "the refusal must carry the cap read from the engine: {err:?}"
+    );
+
+    // AND THE REFUSED POOL HOLDS NOTHING OPEN against that same cap: `connect`
+    // closes it, awaiting every connection, before returning the refusal. A
+    // pool merely dropped closes its connections later, in the background.
+    assert_eq!(
+        sessions_of("ys_cap_refused").await,
+        0,
+        "a refused boot left sessions open against the account's cap"
+    );
+}
+
+/// Sessions the account holds right now, asked as root.
+async fn sessions_of(user: &str) -> i64 {
+    let mut root = common::root().await;
+    sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER = ?")
+        .bind(user)
+        .fetch_one(&mut root)
+        .await
+        .expect("processlist")
+}
+
+/// And the shape ADR-1006 ships, 3 x 6 = 18, connects under the same cap.
+#[tokio::test]
+async fn connect_accepts_a_pool_within_the_users_connection_cap() {
+    let (mut cfg, secret) = capped_user("ys_user_cap_ok", "ys_cap_ok", 20).await;
+    cfg.max_connections = 3;
+    cfg.replicas = 6;
+
+    let pool = yadgar_store::pool::connect(&cfg, &secret)
+        .await
+        .expect("18 connections fit an account capped at 20");
+    let one: i64 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("query");
+    assert_eq!(one, 1);
+}

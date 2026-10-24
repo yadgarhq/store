@@ -158,3 +158,85 @@ fn the_lock_name_every_service_takes_is_pinned() {
     let lock = LockOptions::new(60).expect("60 seconds is a wait");
     assert_eq!(lock.name(), "yadgar_migrate");
 }
+
+// ---------------------------------------------------------------------------
+// The per-database lock name (yaadgaar #368, ADR-1006), release A.
+//
+// `GET_LOCK` names are server-wide, so one `yadgar_migrate` serialised every
+// module whose database shares a server. Release A takes the legacy name AND
+// `yadgar_migrate:<database>`; release B drops the legacy one. These pin the
+// spelling of both, because replicas that disagree on a name do not serialise.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_per_database_lock_name_is_the_legacy_name_and_the_database() {
+    let lock = LockOptions::new(60).expect("60 seconds is a wait");
+    assert_eq!(lock.per_database_name("task"), "yadgar_migrate:task");
+}
+
+/// 64 characters is MySQL's `GET_LOCK` limit (MariaDB 11.8.9 measured 192;
+/// the lower bound is the portable one, D80). `yadgar_migrate:` is 15, so a
+/// 49-character database name is the longest that stays literal.
+#[test]
+fn a_per_database_name_of_exactly_64_characters_stays_literal() {
+    let lock = LockOptions::new(60).expect("60 seconds is a wait");
+    let db = "a".repeat(49);
+    let name = lock.per_database_name(&db);
+    assert_eq!(name, format!("yadgar_migrate:{db}"));
+    assert_eq!(name.chars().count(), 64);
+}
+
+/// Past 64 the name is the prefix and the first 16 hex digits of SHA-256 of
+/// the database name. Pinned to the digest itself, so a change of hash, of
+/// length or of input reddens here rather than splitting a rollout.
+#[test]
+fn a_per_database_name_past_64_characters_is_hashed() {
+    let lock = LockOptions::new(60).expect("60 seconds is a wait");
+    assert_eq!(
+        lock.per_database_name(&"a".repeat(50)),
+        "yadgar_migrate:160b4e433e384e05"
+    );
+    // A database name may be 64 characters itself, 79 with the prefix.
+    let longest = lock.per_database_name(&"a".repeat(64));
+    assert_eq!(longest, "yadgar_migrate:ffe054fe7ae0cb6d");
+    assert!(longest.chars().count() <= 64);
+}
+
+/// Characters, not bytes: MySQL counts the limit in characters, so a
+/// multibyte name that fits in 64 characters stays literal.
+#[test]
+fn the_length_limit_counts_characters_not_bytes() {
+    let lock = LockOptions::new(60).expect("60 seconds is a wait");
+    let db = "é".repeat(49);
+    assert_eq!(lock.per_database_name(&db), format!("yadgar_migrate:{db}"));
+}
+
+/// The test-support override must move BOTH names, or a suite that holds a
+/// lock on purpose collides with every other test on the shared legacy name.
+#[test]
+fn with_name_overrides_the_legacy_and_the_per_database_name() {
+    let lock = LockOptions::new(60)
+        .expect("60 seconds is a wait")
+        .with_name("yadgar_migrate_test");
+    assert_eq!(lock.name(), "yadgar_migrate_test");
+    assert_eq!(lock.per_database_name("db"), "yadgar_migrate_test:db");
+}
+
+/// A refusal names the lock it could not take and the chart key for the
+/// wait, and no longer claims the holder is "another replica": on a shared
+/// server it may be another module entirely.
+#[test]
+fn lock_unavailable_names_the_lock_and_the_wait_key() {
+    let err = MigrationError::LockUnavailable {
+        name: "yadgar_migrate:task".into(),
+        seconds: 7,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("yadgar_migrate:task"), "{msg}");
+    assert!(msg.contains("7s"), "{msg}");
+    assert!(
+        msg.contains("database.migrationLockTimeoutSeconds"),
+        "{msg}"
+    );
+    assert!(!msg.contains("Another replica is"), "{msg}");
+}
