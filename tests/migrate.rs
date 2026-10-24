@@ -117,7 +117,7 @@ fn a_database_level_with_the_binary_is_fine() {
 /// MEASURED on MariaDB 11.8.9: `GET_LOCK(name, -1)` returns NULL at once with
 /// warning 1411 "Incorrect timeout value", EVEN WHEN NOBODY HOLDS THE LOCK. Passed
 /// through, the migration never runs and the boot fails as `LockUnavailable` —
-/// telling the operator another replica is migrating when none is.
+/// telling the operator another process holds the lock when none does.
 #[test]
 fn a_negative_lock_wait_is_refused_before_it_reaches_the_engine() {
     let err = LockOptions::new(-1).expect_err("a negative wait never takes the lock");
@@ -239,4 +239,28 @@ fn lock_unavailable_names_the_lock_and_the_wait_key() {
         "{msg}"
     );
     assert!(!msg.contains("Another replica is"), "{msg}");
+}
+
+/// The whole text, pinned (yaadgaar #368 step 5). Release B takes only the
+/// per-database lock, so the message names that lock and says what is true of
+/// any holder: another process on this database server has it. It must not
+/// guess "another replica" — the holder may be another install of the module,
+/// or a process that died holding its connection.
+#[test]
+fn lock_unavailable_message_is_exact() {
+    let err = MigrationError::LockUnavailable {
+        name: "yadgar_migrate:task".into(),
+        seconds: 7,
+    };
+    assert_eq!(
+        err.to_string(),
+        "could not take the per-database migration lock yadgar_migrate:task \
+         within 7s: another process on this database server holds it. It may \
+         be a pod of this module that is still migrating, another install \
+         migrating the same database, or a process that died holding its \
+         connection. Refusing to migrate concurrently — that is what corrupts \
+         a schema. The wait is the chart key \
+         database.migrationLockTimeoutSeconds."
+    );
+    assert!(!err.to_string().contains("replica"), "{err}");
 }
