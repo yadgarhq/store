@@ -20,6 +20,7 @@ use sqlx::MySqlPool;
 use crate::credentials::Secret;
 
 mod error;
+mod user_cap;
 pub use error::PoolError;
 
 /// Re-exported so a `-db` binary names the transport mode through the seam that
@@ -449,6 +450,13 @@ pub async fn connect(config: &PoolConfig, secret: &Secret) -> Result<MySqlPool, 
     config.check_engine_headroom()?;
 
     let options = connect_options(config, secret)?;
+
+    // The account's own cap needs a session to read. It is read on one
+    // connection of its own, closed again, BEFORE the pool exists: a refused
+    // boot then holds nothing open against that same cap, and there is no
+    // pool whose closing a later change could forget.
+    let cap = user_cap::read(config, &options).await?;
+    config.check_user_connection_cap(cap)?;
 
     pool_options(config)
         .connect_with(options)

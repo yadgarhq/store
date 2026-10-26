@@ -634,3 +634,111 @@ fn the_smallest_nonzero_pool_settings_are_accepted() {
     c.operator_reserve = 1;
     assert!(c.check_engine_headroom().is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// The database USER's connection cap (yaadgaar #200, ADR-1006).
+//
+// The engine headroom check above compares the pool arithmetic with the
+// engine's `max_connections`. MariaDB also caps each ACCOUNT, through the
+// user's `MAX_USER_CONNECTIONS` (or the global `max_user_connections` when the
+// account sets none). Live on kind-yadgar the operator writes 20 for every
+// app user, while each -db ran 8 connections x 6 replicas = 48: the engine
+// check passed, and the seventh connection past 20 would have failed with
+// error 1226 once KEDA scaled out.
+// ---------------------------------------------------------------------------
+
+/// 8 x 6 = 48 against the live cap of 20: refused, naming both numbers and
+/// every chart key an operator could change.
+#[test]
+fn a_pool_that_exceeds_the_users_connection_cap_is_refused() {
+    let mut c = cfg();
+    c.max_connections = 8;
+    c.replicas = 6;
+
+    let err = c
+        .check_user_connection_cap(20)
+        .expect_err("48 connections cannot fit a user capped at 20");
+    assert!(
+        matches!(
+            err,
+            PoolError::WouldExceedUserCap {
+                requested: 48,
+                cap: 20,
+                ..
+            }
+        ),
+        "wrong refusal: {err:?}"
+    );
+    let msg = err.to_string();
+    for needle in [
+        "48",
+        "20",
+        "task",
+        "database.maxConnections",
+        "DB_MAX_CONNECTIONS",
+        "autoscaling.maxReplicas",
+        "replicaCount",
+        "REPLICAS",
+        "MAX_USER_CONNECTIONS",
+        "maxUserConnections",
+    ] {
+        assert!(msg.contains(needle), "message must name {needle}: {msg}");
+    }
+}
+
+/// ADR-1006's shipped shape: 3 per replica x 6 = 18 fits under 20.
+#[test]
+fn three_per_replica_at_six_replicas_fits_the_live_cap() {
+    let mut c = cfg();
+    c.max_connections = 3;
+    c.replicas = 6;
+    assert!(c.check_user_connection_cap(20).is_ok());
+}
+
+/// Equal is a fit: the cap is the most the user may hold, not one above it.
+#[test]
+fn a_pool_exactly_at_the_cap_is_accepted() {
+    let mut c = cfg();
+    c.max_connections = 4;
+    c.replicas = 5;
+    assert!(c.check_user_connection_cap(20).is_ok());
+    c.replicas = 6;
+    assert!(
+        c.check_user_connection_cap(20).is_err(),
+        "21+ must not fit 20"
+    );
+}
+
+/// Zero is MariaDB's "no per-user limit", measured on 11.8.9 for an account
+/// with no `MAX_USER_CONNECTIONS` under the default global. Nothing to refuse.
+#[test]
+fn a_cap_of_zero_means_no_per_user_limit() {
+    let mut c = cfg();
+    c.max_connections = 100;
+    c.replicas = 100;
+    assert!(c.check_user_connection_cap(0).is_ok());
+}
+
+/// A single replica still counts as one, the same `replicas.max(1)` the
+/// engine check uses, so a 0 in REPLICAS cannot hide a pool from the cap.
+#[test]
+fn zero_replicas_count_as_one_against_the_cap() {
+    let mut c = cfg();
+    c.max_connections = 21;
+    c.replicas = 0;
+    assert!(c.check_user_connection_cap(20).is_err());
+}
+
+/// A cap that could not be READ is its own refusal, not "could not connect":
+/// the connection worked, the question about the account did not.
+#[test]
+fn an_unreadable_cap_names_the_query_and_not_a_connect_failure() {
+    let err = PoolError::UserCapUnreadable {
+        dsn: cfg().dsn(),
+        source: sqlx::Error::Protocol("boom".into()),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("@@max_user_connections"), "{msg}");
+    assert!(msg.contains("mariadb:3306"), "{msg}");
+    assert!(!msg.starts_with("could not connect"), "{msg}");
+}

@@ -121,11 +121,22 @@ pub enum MigrationError {
     Engine(#[source] sqlx::Error),
 
     #[error(
-        "could not take the migration lock within {seconds}s. Another replica is \
-         migrating and has not finished, or one died holding a connection. \
-         Refusing to migrate concurrently — that is what corrupts a schema."
+        "could not take the per-database migration lock {name} within \
+         {seconds}s: another process on this database server holds it. It may \
+         be a pod of this module that is still migrating, another install \
+         migrating the same database, or a process that died holding its \
+         connection. Refusing to migrate concurrently — that is what corrupts \
+         a schema. The wait is the chart key \
+         database.migrationLockTimeoutSeconds."
     )]
-    LockUnavailable { seconds: i32 },
+    LockUnavailable { name: String, seconds: i32 },
+
+    #[error(
+        "the migration pool has no default database (SELECT DATABASE() is \
+         NULL), so there is nothing to migrate and no name for the \
+         per-database migration lock. Set the chart key database.name."
+    )]
+    NoDatabase,
 
     #[error(
         "the migration lock wait must be at least 1 second, and {seconds} was \
@@ -152,18 +163,45 @@ use sqlx::{AssertSqlSafe, MySqlPool};
 /// updated — so the history is readable, not just the high-water mark.
 const LEDGER: &str = "yadgar_schema_migrations";
 
-/// A cluster-wide lock name, so concurrent replicas serialise on migration.
+/// The PREFIX of the per-database lock name ([`LockOptions::per_database_name`]),
+/// so concurrent replicas of one database serialise on migration.
 ///
-/// MariaDB's GET_LOCK is held by a CONNECTION and released when it drops, which
-/// is the property that matters here: a replica killed mid-migration cannot
-/// leave the lock held forever.
+/// MariaDB's GET_LOCK is held by a SESSION and released when the session ends,
+/// which is the property that matters here: a replica killed mid-migration
+/// cannot leave the lock held forever. A session ends when its connection
+/// CLOSES, not when a pooled handle to it drops: a dropped handle returns the
+/// session to the pool with its locks still held, which is why `apply` marks
+/// its lock connection `close_on_drop`.
 ///
 /// **THIS IS AN ADDRESS, NOT A KNOB**, in the sense `yadgar-lifecycle`'s
 /// `CONFIG_DIR` is one. ADR-0569 governs the VALUE of a setting. A lock name is
 /// an identifier every replica of a module must agree on, or they do not
 /// serialise against each other; letting an installation vary it would buy
 /// nothing and could only break that. `tests/migrate.rs` pins the spelling.
+///
+/// **ITS SCOPE WAS THE DEFECT (yaadgaar #368, ADR-1006).** `GET_LOCK` names are
+/// server-wide, so every module whose database shares one server serialised its
+/// migrations on this one name. The fix is a per-database name
+/// ([`LockOptions::per_database_name`]), rolled out in two releases because a
+/// rollout runs old and new pods at once:
+///
+/// - **Release A (v0.5.x)** took this name alone, server-wide (the legacy
+///   lock), FIRST and then the per-database name, on the same connection.
+///   Pods older than A take only the legacy name, so they serialised against
+///   A pods.
+/// - **Release B (this one)** takes only the per-database name. Release A pods
+///   hold that name too, so A and B still serialise. B must not reach a module
+///   until every pod of it runs A: a pod older than A and a B pod share no
+///   name, which reopens D55's double-CREATE race for the rollout. For the
+///   same reason a module running B rolls back only to A, never to v0.4.x.
 const LOCK: &str = "yadgar_migrate";
+
+/// MySQL's `GET_LOCK` name limit, in characters. MariaDB 11.8.9 measured 192;
+/// the lower one is the bound that holds on every engine D80 admits.
+const LOCK_NAME_MAX_CHARS: usize = 64; // ADR-0569-EXCEPTION(CC): an engine limit, not a tunable.
+
+/// Hex digits of SHA-256 kept when a per-database name would pass the limit.
+const LOCK_NAME_HASH_HEX: usize = 16; // ADR-0569-EXCEPTION(CC): part of the lock address every replica must agree on.
 
 /// Which lock to take, and how long to wait for it.
 ///
@@ -175,21 +213,21 @@ const LOCK: &str = "yadgar_migrate";
 /// wait is a knob, and a knob is read from the owning service's configuration
 /// and handed in. The caller is the one that knows which knob and which file to
 /// name when it is absent; this crate refuses only a value that cannot mean
-/// "wait for the other replica", via [`LockOptions::new`].
+/// "wait for the process that holds the lock", via [`LockOptions::new`].
 ///
 /// The fields are private so that refusal cannot be stepped around with a
 /// struct literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockOptions {
-    /// Server-wide `GET_LOCK` name. [`LOCK`] outside tests.
+    /// Prefix of the per-database `GET_LOCK` name. [`LOCK`] outside tests.
     name: String,
     /// Seconds to wait before giving up and failing the boot. Always >= 1.
     timeout_secs: i32,
 }
 
 impl LockOptions {
-    /// The migration lock, waiting `timeout_secs` for another replica's
-    /// migration before failing the boot.
+    /// The migration lock, waiting `timeout_secs` for whichever process on
+    /// this database server holds it before failing the boot.
     ///
     /// # Errors
     ///
@@ -200,7 +238,7 @@ impl LockOptions {
     ///   "Incorrect timeout value", even when nobody holds the lock. Passed
     ///   through, the migration never runs and the boot fails as
     ///   [`MigrationError::LockUnavailable`], telling the operator another
-    ///   replica is migrating when none is;
+    ///   process holds the lock when none does;
     /// - ZERO makes `GET_LOCK` try once and not wait. D55 starts two replicas at
     ///   once, so the second fails its boot on every rollout that carries a
     ///   migration.
@@ -229,12 +267,31 @@ impl LockOptions {
         self
     }
 
-    /// The `GET_LOCK` name this takes.
+    /// The prefix of the per-database `GET_LOCK` name. Release B no longer
+    /// takes this name by itself.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Seconds a replica waits for another one's migration.
+    /// The per-database `GET_LOCK` name for `database`: the prefix, a colon,
+    /// and the database name. When that would pass 64 characters it is the
+    /// prefix, a colon, and the first 16 hex digits of SHA-256 of the
+    /// database name instead. A database name may itself be 64 characters.
+    ///
+    /// Under `with_name` the override replaces the prefix too, so a test that
+    /// holds a lock on purpose collides with no other test on either name.
+    pub fn per_database_name(&self, database: &str) -> String {
+        let literal = format!("{}:{database}", self.name);
+        if literal.chars().count() <= LOCK_NAME_MAX_CHARS {
+            return literal;
+        }
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(database.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{}:{}", self.name, &hex[..LOCK_NAME_HASH_HEX])
+    }
+
+    /// Seconds to wait for the process that holds the lock.
     pub fn timeout_secs(&self) -> i32 {
         self.timeout_secs
     }
@@ -268,32 +325,74 @@ pub async fn apply(
     // A transaction would not have helped: MariaDB commits implicitly on DDL, so
     // the racing CREATE TABLE is visible the moment it runs.
     //
-    // The lock is held by a CONNECTION and released when that connection drops,
-    // so a replica killed mid-migration cannot strand it.
+    // The lock is held by a SESSION. A killed process ends its sessions, so a
+    // replica killed mid-migration cannot strand it. An in-process CANCELLATION
+    // is different: dropping this future (a caller's timeout, a shutdown
+    // `select!`) drops the pooled handle, and by default that RETURNS the
+    // session to the pool still holding every lock it took — and still
+    // waiting server-side on one it asked for (measured on MariaDB 11.8.9:
+    // both names held 7 s later; review S1/S3 on store#37). `close_on_drop`
+    // ends the session instead, and the server releases its locks.
     let mut lock_conn = pool.acquire().await.map_err(MigrationError::engine)?;
-    let acquired: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, ?)")
-        .bind(&lock.name)
-        .bind(lock.timeout_secs)
+    lock_conn.close_on_drop();
+
+    // The database the migrations will run in names the per-database lock.
+    // Asked of the engine, not of the configuration: it is the session's own
+    // answer, the one the migrations will actually see.
+    let database: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
         .fetch_one(&mut *lock_conn)
         .await
         .map_err(MigrationError::engine)?;
+    let per_database = lock.per_database_name(&database.ok_or(MigrationError::NoDatabase)?);
 
-    if acquired != Some(1) {
-        return Err(MigrationError::LockUnavailable {
-            seconds: lock.timeout_secs,
-        });
-    }
+    // RELEASE B: the per-database name only (see `LOCK`).
+    take_lock(
+        &mut lock_conn,
+        &per_database,
+        lock.timeout_secs,
+        lock.timeout_secs,
+    )
+    .await?;
 
     let outcome = apply_locked(pool, set).await;
 
-    // Released explicitly rather than left to the connection dropping, so the
-    // next replica proceeds immediately instead of waiting on pool recycling.
-    let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
-        .bind(&lock.name)
-        .execute(&mut *lock_conn)
-        .await;
+    // Released explicitly rather than left to the close on drop, so the next
+    // replica proceeds immediately.
+    release_lock(&mut lock_conn, &per_database).await;
 
     outcome
+}
+
+/// Take `name`, waiting up to `wait_secs`. A refusal reports `budget_secs`,
+/// the whole wait the operator configured, which is the number they can act on.
+/// A `wait_secs` of 0 tries once; that is the end of a spent budget, not the
+/// zero wait `LockOptions::new` refuses.
+async fn take_lock(
+    conn: &mut sqlx::MySqlConnection,
+    name: &str,
+    wait_secs: i32,
+    budget_secs: i32,
+) -> Result<(), MigrationError> {
+    let acquired: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, ?)")
+        .bind(name)
+        .bind(wait_secs)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(MigrationError::engine)?;
+    if acquired != Some(1) {
+        return Err(MigrationError::LockUnavailable {
+            name: name.to_string(),
+            seconds: budget_secs,
+        });
+    }
+    Ok(())
+}
+
+async fn release_lock(conn: &mut sqlx::MySqlConnection, name: &str) {
+    let _ = sqlx::query("SELECT RELEASE_LOCK(?)")
+        .bind(name)
+        .execute(&mut *conn)
+        .await;
 }
 
 async fn apply_locked(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, MigrationError> {

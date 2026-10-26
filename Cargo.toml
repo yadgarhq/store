@@ -10,6 +10,9 @@ repository = "https://github.com/yadgarhq/store"
 [dependencies]
 thiserror = "2"
 tracing = "0.1"
+# The per-database migration lock name is hashed when it would pass MySQL's
+# 64-character GET_LOCK limit. Already in the tree through sqlx-mysql's auth.
+sha2 = "0.10"
 
 # rustls, never native-tls (D63). native-tls links OpenSSL, which means a
 # glibc-linked binary, which means distroless/cc instead of distroless/static

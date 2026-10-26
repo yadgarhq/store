@@ -89,6 +89,21 @@ itself holding. Measured before the floor existed — boot hung for 30.0s and th
 failed with "pool timed out while waiting for an open connection", which names
 the pool rather than the cause.
 
+### The database account's own cap is checked too
+
+MariaDB caps each account as well as the engine: the user's
+`MAX_USER_CONNECTIONS`, or the global `max_user_connections` when the account
+sets none. `pool::connect` reads that cap from the engine on one connection of
+its own, closed again before any pool exists (`SELECT @@max_user_connections`,
+which reports the limit for the session's own account — measured on 11.8.9). It
+refuses with `PoolError::WouldExceedUserCap` when `max_connections x replicas`
+exceeds the cap, and with `PoolError::UserCapUnreadable` when the cap cannot be
+read. Zero means no per-user limit. The refusal names the
+chart keys to change: `database.maxConnections`, `autoscaling.maxReplicas` or
+`replicaCount`, or the account's limit (mariadb-operator's
+`User.spec.maxUserConnections`). The estate hit this: the operator writes 20,
+and each `-db` shipped 8 per replica at a KEDA ceiling of 6 (ADR-1006).
+
 ### Migrations refuse a database ahead of the binary
 
 The deployment that matters is a rollback: the database sits at version 5 while
@@ -106,6 +121,33 @@ configuration and refuse to start when it is absent. `new` refuses anything belo
 because MariaDB 11.8 answers a negative wait with NULL at once and a zero wait
 does not wait at all. The lock NAME stays a constant: it is an address every
 replica must agree on, not a setting.
+
+### The migration lock is per database, in two releases
+
+`GET_LOCK` names are server-wide, so the one name `yadgar_migrate` serialised
+every module whose database shares a server, and its refusal blamed "another
+replica". The new name is `yadgar_migrate:<database>` (the database from
+`SELECT DATABASE()`; past 64 characters, the prefix plus 16 hex digits of
+SHA-256 of the database name). The change ships in two releases, because a
+rollout runs old and new pods together (ADR-1006):
+
+- **Release A** (v0.5.x) took `yadgar_migrate` first, then the per-database
+  name, on one connection. Pods on older releases still serialised against it.
+- **Release B** (this one) takes only the per-database name. **Every pod of a
+  module must run release A before release B reaches it**; skipping A lets an
+  old pod and a B pod migrate the same database at once.
+
+**Upgrading from v0.4.x or earlier: pass through v0.5.x.** Deploy a v0.5.x
+release to every pod of every module first, and only then this one. **Rolling
+back from this release goes to v0.5.x only, never to v0.4.x**, for the same
+reason: a v0.4.x pod and a pod on this release share no lock name.
+
+A pool with no default database is refused with `MigrationError::NoDatabase`.
+
+`GET_LOCK` is held by a session, so the lock connection is marked
+`close_on_drop`: a cancelled `apply` (a caller's timeout, a shutdown) ends the
+session and frees both names, instead of returning a pooled session that still
+holds them.
 
 ## Status
 
