@@ -3,7 +3,8 @@
 //! D7 keeps `store` free of entity schemas, so it cannot hold anyone's
 //! migrations. It can only take what a module hands it and guarantee three
 //! things: applied in version order, applied exactly once, and never applied to
-//! a database that has already moved past them.
+//! a database that has already moved past them. A fourth since #249: never run
+//! against a database whose applied migrations differ from the ones handed in.
 //!
 //! Everything here is the ordering and safety logic, deliberately separate from
 //! executing SQL, because that half is testable without a database and is where
@@ -109,6 +110,33 @@ pub enum MigrationError {
     )]
     DatabaseAhead { applied: u64, known: u64 },
 
+    #[error(
+        "migration {version} ({name}) was edited after it was applied: the \
+         ledger records SQL with sha256 {recorded}, this binary carries \
+         {embedded}. The database never ran the new SQL, so it does not have \
+         the schema this binary expects. Refusing to start. Restore the \
+         migration as it shipped and put the change in a new migration."
+    )]
+    ChecksumMismatch {
+        version: u64,
+        name: String,
+        recorded: String,
+        embedded: String,
+    },
+
+    #[error(
+        "migration {version} is recorded in the ledger as {recorded}, with no \
+         checksum, but this binary's migration {version} is {embedded}. The \
+         ledger predates checksums, so its name is the only evidence of what \
+         ran, and it is not this migration. Refusing to start rather than \
+         recording this binary's checksum for SQL that never ran."
+    )]
+    LedgerNameMismatch {
+        version: u64,
+        recorded: String,
+        embedded: String,
+    },
+
     #[error("migration {version} ({name}) failed: {source}")]
     Failed {
         version: u64,
@@ -159,8 +187,15 @@ impl MigrationError {
 
 use sqlx::{AssertSqlSafe, MySqlPool};
 
+/// The checksum half of the ledger (#249): adding the column to an older
+/// ledger, and verifying or backfilling every applied row.
+mod checksum;
+use checksum::{add_checksum_column, verify_checksums};
+
 /// Where the applied version is recorded. One row per applied migration, never
-/// updated — so the history is readable, not just the high-water mark.
+/// updated — so the history is readable, not just the high-water mark. The one
+/// exception is the one-time backfill of `checksum` on a row written before
+/// checksums existed (`checksum.rs`).
 const LEDGER: &str = "yadgar_schema_migrations";
 
 /// The PREFIX of the per-database lock name ([`LockOptions::per_database_name`]),
@@ -402,12 +437,14 @@ async fn apply_locked(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, Migra
         "CREATE TABLE IF NOT EXISTS {LEDGER} (
              version BIGINT UNSIGNED NOT NULL PRIMARY KEY,
              name    VARCHAR(255)    NOT NULL,
-             applied_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+             applied_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             checksum CHAR(64)       NULL
          )"
     )))
     .execute(pool)
     .await
     .map_err(MigrationError::engine)?;
+    add_checksum_column(pool).await?;
 
     // AUDIT: LEDGER const only.
     let applied: u64 = sqlx::query_scalar(AssertSqlSafe(format!(
@@ -423,6 +460,8 @@ async fn apply_locked(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, Migra
 
     // Before applying anything: refuse a database this binary is older than.
     set.check_not_ahead(applied)?;
+    // Before applying anything: refuse a database that ran other SQL.
+    verify_checksums(pool, set).await?;
 
     let mut current = applied;
     for m in set.pending_after(applied) {
@@ -441,12 +480,13 @@ async fn apply_locked(pool: &MySqlPool, set: &MigrationSet) -> Result<u64, Migra
                 source: e,
             })?;
 
-        // AUDIT: LEDGER const; version and name are bound parameters.
+        // AUDIT: LEDGER const; version, name and checksum are bound parameters.
         sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO {LEDGER} (version, name) VALUES (?, ?)"
+            "INSERT INTO {LEDGER} (version, name, checksum) VALUES (?, ?, ?)"
         )))
         .bind(m.version)
         .bind(&m.name)
+        .bind(m.checksum())
         .execute(pool)
         .await
         .map_err(MigrationError::engine)?;
