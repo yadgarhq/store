@@ -264,3 +264,20 @@ fn lock_unavailable_message_is_exact() {
     );
     assert!(!err.to_string().contains("replica"), "{err}");
 }
+
+/// The checksum the ledger records is SHA-256 of the SQL's exact bytes, in
+/// lowercase hex — the same digest a module's own frozen-migration test computes
+/// (project-db `tests/migrations_frozen.rs`), so the two can be compared by eye.
+/// Exact bytes, not normalised SQL: whitespace inside a string literal is data.
+#[test]
+fn a_migration_checksum_is_sha256_of_its_sql_in_lowercase_hex() {
+    assert_eq!(
+        m(1, "first", "SELECT 1").checksum(),
+        "e004ebd5b5532a4b85984a62f8ad48a81aa3460c1ca07701f386135d72cdecf5"
+    );
+    assert_ne!(
+        m(1, "first", "SELECT 1").checksum(),
+        m(1, "first", "SELECT  1").checksum(),
+        "one extra space is a different migration"
+    );
+}
