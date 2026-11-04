@@ -89,6 +89,22 @@ fn a_replica_count_that_would_exhaust_the_engine_is_rejected_at_boot() {
     ));
     let msg = err.to_string();
     assert!(msg.contains("200") && msg.contains("151"), "got: {msg}");
+    // The refusal names every chart key an operator could change, as the
+    // user-cap refusal below does, so an operator reading the crash log does
+    // not have to find the key.
+    for needle in [
+        "database.maxConnections",
+        "DB_MAX_CONNECTIONS",
+        "autoscaling.maxReplicas",
+        "replicaCount",
+        "REPLICAS",
+        "database.engineMaxConnections",
+        "DB_ENGINE_MAX_CONNECTIONS",
+        "database.engineOperatorReserve",
+        "DB_ENGINE_OPERATOR_RESERVE",
+    ] {
+        assert!(msg.contains(needle), "message must name {needle}: {msg}");
+    }
 }
 
 #[test]
