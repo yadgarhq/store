@@ -17,6 +17,12 @@ pub enum PoolError {
         "pool would exhaust the engine: {requested} connections requested \
          (max_connections x replicas) against an engine allowing {available}, \
          of which {reserved} stay reserved so an operator can still connect. \
+         Lower the chart key database.maxConnections (DB_MAX_CONNECTIONS) or \
+         the replica ceiling (autoscaling.maxReplicas when autoscaling.enabled \
+         is true, or replicaCount; REPLICAS), or raise database.engineMaxConnections \
+         (DB_ENGINE_MAX_CONNECTIONS) to match the engine's real ceiling; \
+         database.engineOperatorReserve (DB_ENGINE_OPERATOR_RESERVE) sets how \
+         many connections stay free. \
          Refusing at boot — the alternative surfaces as intermittent \
          'too many connections' under load, on whichever service connects last."
     )]
