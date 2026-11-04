@@ -67,8 +67,9 @@ pub(super) async fn add_checksum_column(pool: &MySqlPool) -> Result<(), Migratio
 /// Every row is checked before any backfill is written, so a refusal writes no
 /// checksum. The `checksum` column itself may already exist by then:
 /// [`add_checksum_column`] runs first and its `ALTER` is DDL, which commits at
-/// once. A recorded version this binary does not carry is not
-/// checked here; one above the newest is refused by `check_not_ahead`.
+/// once. Every recorded version is one this binary carries by the time this
+/// runs: one above the newest is refused by `check_not_ahead`, and one below it
+/// by `check_ledger` (#487).
 pub(super) async fn verify_checksums(
     pool: &MySqlPool,
     set: &MigrationSet,
