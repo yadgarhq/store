@@ -281,3 +281,87 @@ fn a_migration_checksum_is_sha256_of_its_sql_in_lowercase_hex() {
         "one extra space is a different migration"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Gaps below the ledger's newest row (yaadgaar #487). `pending_after` and
+// `check_not_ahead` look only at the ledger's MAXIMUM, so a hole below it was
+// invisible in both directions. Both refuse the boot, before anything runs.
+// ---------------------------------------------------------------------------
+
+/// Direction (a): migration 2 joined the set after migration 3 had already run.
+/// `pending_after(3)` never yields it, so it would never apply.
+#[test]
+fn an_embedded_migration_below_the_ledger_maximum_with_no_row_is_refused() {
+    let set = MigrationSet::new(vec![
+        m(1, "first", "SELECT 1"),
+        m(2, "late", "SELECT 2"),
+        m(3, "third", "SELECT 3"),
+    ])
+    .unwrap();
+    let err = set.check_ledger(&[1, 3]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            MigrationError::NotApplied {
+                version: 2,
+                applied: 3,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("late"),
+        "names the migration: {err}"
+    );
+}
+
+/// Direction (b): the ledger records migration 2, and this binary does not
+/// carry it. Nothing checked such a row: `check_not_ahead` looks only above the
+/// maximum, and the checksum pass skips versions the set does not hold.
+#[test]
+fn a_ledger_row_the_binary_does_not_carry_is_refused() {
+    let set =
+        MigrationSet::new(vec![m(1, "first", "SELECT 1"), m(3, "third", "SELECT 3")]).unwrap();
+    let err = set.check_ledger(&[1, 2, 3]).unwrap_err();
+    assert!(
+        matches!(err, MigrationError::LedgerUnknown { version: 2 }),
+        "{err:?}"
+    );
+}
+
+/// The boundary: a migration AT the ledger maximum is the maximum's own row,
+/// and one above it is ordinary pending work. Neither is a gap.
+#[test]
+fn a_ledger_without_holes_passes_whatever_is_pending_above_it() {
+    let set = MigrationSet::new(vec![
+        m(1, "first", "SELECT 1"),
+        m(2, "second", "SELECT 2"),
+        m(3, "third", "SELECT 3"),
+    ])
+    .unwrap();
+    for ledger in [&[][..], &[1], &[1, 2], &[1, 2, 3]] {
+        assert!(set.check_ledger(ledger).is_ok(), "{ledger:?}");
+    }
+}
+
+/// The maximum itself must be in the set, or it is a ledger row the binary
+/// does not carry. Covers the boundary from the other side: a recorded version
+/// equal to an embedded one is never a gap.
+#[test]
+fn a_ledger_missing_its_own_first_row_is_refused() {
+    let set =
+        MigrationSet::new(vec![m(1, "first", "SELECT 1"), m(2, "second", "SELECT 2")]).unwrap();
+    let err = set.check_ledger(&[2]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            MigrationError::NotApplied {
+                version: 1,
+                applied: 2,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
