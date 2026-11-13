@@ -2,7 +2,7 @@
 name = "yadgar-store"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 license = "Apache-2.0"
 description = "Engine primitives for yadgar -db services: pool, transactions, migrations, capability probe, credentials, backup harness. Knows zero entity schemas."
 repository = "https://github.com/yadgarhq/store"
